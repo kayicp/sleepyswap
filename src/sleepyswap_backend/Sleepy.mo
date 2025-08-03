@@ -4,16 +4,39 @@ import ICRC_1_Types "../util/motoko/ICRC-1/Types";
 import Error "../util/motoko/Error";
 
 module {
+
+  public let SELL_TOKEN = "sleepyswap:sell_token_canister_id";
+  public let BUY_TOKEN = "sleepyswap:buy_token_canister_id";
+  public let MAX_ORDER_BATCH = "sleepyswap:max_order_batch_size";
+
   public type Order = {
     created_at_time : Nat64;
-    owner : Principal;
-    subaccount : ?Blob;
+    owner : Nat; // user id
+    subaccount : Nat; // user's subaccount id
     is_buy : Bool;
     price : Nat;
     amount : Nat;
     remaining : Nat;
     available : Nat;
     trades : RBTree.Type<Nat, ()>; // trade ids
+    close : ?{
+      #Canceled : { timestamp : Nat64 };
+      #InsufficientFunds : {
+        canister_id : Principal;
+        subaccount : ?Blob;
+        current_balance : Nat;
+        minimum_balance : Nat;
+        timestamp : Nat64;
+      };
+      #InsufficientAllowance : {
+        canister_id : Principal;
+        subaccount : ?Blob;
+        current_allowance : Nat;
+        minimum_allowance : Nat;
+        timestamp : Nat64;
+      };
+      #Filled : { timestamp : Nat64 };
+    };
   };
   public type Book = RBTree.Type<Nat, RBTree.Type<Nat, ()>>; // price to order ids
   type Call<OkT, ErrT> = {
@@ -31,30 +54,65 @@ module {
       transfer : RBTree.Type<Nat64, Call<Nat, ICRC_1_Types.TransferError>>;
     };
   };
-  public type User = {
-    credit : Nat;
+  type Subaccount = {
+    id : Nat;
+    orders : RBTree.Type<Nat, ()>; // order ids by time
     // order ids by price
     // note: cant place order on same price
     sell_prices : RBTree.Type<Nat, Nat>;
     buy_prices : RBTree.Type<Nat, Nat>;
-    orders : RBTree.Type<Nat, ()>; // order ids by time
     trades : RBTree.Type<Nat, ()>; // trade ids
   };
-  public type Users = RBTree.Type<Principal, RBTree.Type<Blob, User>>;
-  public type PlaceArg = [{
+  public type User = {
+    id : Nat;
+    credit : Nat;
+    subaccounts : RBTree.Type<Blob, Subaccount>;
+    subaccount_ids : RBTree.Type<Nat, Blob>;
+  };
+  type OrderArg = { price : Nat; amount : Nat };
+  public type PlaceArg = {
+    // payment
     subaccount : ?Blob;
-    price : Nat;
-    amount : Nat;
-    is_buy : Bool;
     created_at_time : ?Nat64;
-  }];
+    buy_orders : [OrderArg];
+    sell_orders : [OrderArg];
+  };
   public type PlaceError = {
     #GenericError : Error.Type;
-    #GenericBatchError : Error.Type;
+    #BatchTooLarge : { current_batch_size : Nat; maximum_batch_size : Nat };
+    #DuplicateSellPrice : { price : Nat; indexes : [Nat] };
+    #DuplicateBuyPrice : { price : Nat; indexes : [Nat] };
+    #OrdersOverlap : {
+      sell_index : Nat;
+      sell_price : Nat;
+      buy_index : Nat;
+      buy_price : Nat;
+    };
+    #ExistingSellPrice : { price : Nat; order_id : Nat };
+    #ExistingBuyPrice : { price : Nat; order_id : Nat };
+    #BuyPriceTooHigh : { price : Nat; maximum_price : Nat };
+    #SellPriceTooHigh : { price : Nat; maximum_price : Nat };
+    #BuyPriceTooLow : { price : Nat; minimum_price : Nat };
+    #SellPriceTooLow : { price : Nat; minimum_price : Nat };
+    #InsufficientFunds : {
+      canister_id : Principal;
+      subaccount : ?Blob;
+      current_balance : Nat;
+      minimum_balance : Nat;
+    };
+    #InsufficientAllowance : {
+      canister_id : Principal;
+      subaccount : ?Blob;
+      current_allowance : Nat;
+      minimum_allowance : Nat;
+    };
+    #Duplicate : { duplicate_of : Nat };
+    #CreatedInFuture : { ledger_time : Nat64 };
+    #TooOld;
   };
-  public type PlaceResult = [?Result.Type<Nat, PlaceError>];
+  public type PlaceResult = Result.Type<[Nat], PlaceError>;
 
-  public type CancelArg = [{ id : Nat; subaccount : ?Nat }];
+  public type CancelArg = [{ id : Nat; subaccount : ?Blob }];
   public type CancelError = {
     #GenericError : Error.Type;
     #GenericBatchError : Error.Type;
