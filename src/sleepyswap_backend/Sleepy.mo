@@ -2,6 +2,7 @@ import RBTree "../util/motoko/StableCollections/RedBlackTree/RBTree";
 import Result "../util/motoko/Result";
 import ICRC_1_Types "../util/motoko/ICRC-1/Types";
 import Error "../util/motoko/Error";
+import Order "mo:base/Order";
 
 module {
 
@@ -56,18 +57,30 @@ module {
   };
   type Subaccount = {
     id : Nat;
-    orders : RBTree.Type<Nat, ()>; // order ids by time
-    // order ids by price
+    orders : RBTree.Type<(id : Nat), ()>;
     // note: cant place order on same price
-    sell_prices : RBTree.Type<Nat, Nat>;
-    buy_prices : RBTree.Type<Nat, Nat>;
-    trades : RBTree.Type<Nat, ()>; // trade ids
+    sells : RBTree.Type<(price : Nat), (order : Nat)>;
+    buys : RBTree.Type<(price : Nat), (order : Nat)>;
+    trades : RBTree.Type<(id : Nat), ()>;
+  };
+  public func newSubaccount<K>(ids : RBTree.Type<Nat, K>) : Subaccount = {
+    id = recycleId(ids);
+    orders = RBTree.empty();
+    sells = RBTree.empty();
+    buys = RBTree.empty();
+    trades = RBTree.empty();
   };
   public type User = {
     id : Nat;
     credit : Nat;
     subaccounts : RBTree.Type<Blob, Subaccount>;
     subaccount_ids : RBTree.Type<Nat, Blob>;
+  };
+  public func newUser<K>(ids : RBTree.Type<Nat, K>) : User = {
+    id = recycleId(ids);
+    credit = 0;
+    subaccounts = RBTree.empty();
+    subaccount_ids = RBTree.empty();
   };
   type OrderArg = { price : Nat; amount : Nat };
   public type PlaceArg = {
@@ -88,21 +101,19 @@ module {
       buy_index : Nat;
       buy_price : Nat;
     };
-    #ExistingSellPrice : { price : Nat; order_id : Nat };
-    #ExistingBuyPrice : { price : Nat; order_id : Nat };
-    #BuyPriceTooHigh : { price : Nat; maximum_price : Nat };
-    #SellPriceTooHigh : { price : Nat; maximum_price : Nat };
-    #BuyPriceTooLow : { price : Nat; minimum_price : Nat };
-    #SellPriceTooLow : { price : Nat; minimum_price : Nat };
-    #InsufficientFunds : {
-      canister_id : Principal;
-      subaccount : ?Blob;
-      current_balance : Nat;
-      minimum_balance : Nat;
+    #BuyPriceTooHigh : { price : Nat; index : Nat; maximum_price : Nat };
+    #SellPriceTooHigh : { price : Nat; index : Nat; maximum_price : Nat };
+    #BuyPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
+    #SellPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
+    #ExistingSellPrice : { price : Nat; index : Nat; order_id : Nat };
+    #ExistingBuyPrice : { price : Nat; index : Nat; order_id : Nat };
+    #InsufficientBuyFunds : { current_balance : Nat; minimum_balance : Nat };
+    #InsufficienSellFunds : { current_balance : Nat; minimum_balance : Nat };
+    #InsufficientBuyAllowance : {
+      current_allowance : Nat;
+      minimum_allowance : Nat;
     };
-    #InsufficientAllowance : {
-      canister_id : Principal;
-      subaccount : ?Blob;
+    #InsufficientSellAllowance : {
       current_allowance : Nat;
       minimum_allowance : Nat;
     };
@@ -118,4 +129,9 @@ module {
     #GenericBatchError : Error.Type;
   };
   public type CancelResult = [?Result.Type<(), CancelError>];
+
+  public func recycleId<K>(ids : RBTree.Type<Nat, K>) : Nat = switch (RBTree.minKey(ids), RBTree.maxKey(ids)) {
+    case (?min_id, ?max_id) if (min_id > 0) min_id - 1 else max_id + 1;
+    case _ 0;
+  };
 };

@@ -1,5 +1,6 @@
 import Principal "mo:base/Principal";
 import Nat "mo:base/Nat";
+import Blob "mo:base/Blob";
 import Sleepy "Sleepy";
 
 import RBTree "../util/motoko/StableCollections/RedBlackTree/RBTree";
@@ -26,7 +27,6 @@ shared (install) persistent actor class Canister(
   var trade_id = 0;
   var trades = RBTree.empty<Nat, Sleepy.Trade>();
 
-  var user_id = 0;
   var user_ids = RBTree.empty<Nat, Principal>();
   var users = RBTree.empty<Principal, Sleepy.User>();
 
@@ -44,15 +44,6 @@ shared (install) persistent actor class Canister(
     let max_batch = Value.getNat(metadata, Sleepy.MAX_ORDER_BATCH, 0);
     if (max_batch > 0 and batch_size > max_batch) return #Err(#BatchTooLarge { current_batch_size = batch_size; maximum_batch_size = max_batch });
 
-    var user = switch (RBTree.get(users, Principal.compare, caller)) {
-      case (?found) found;
-      case _ ({
-        id = user_id;
-        credit = 0;
-        subaccounts = RBTree.empty();
-        subaccount_ids = RBTree.empty();
-      });
-    };
     var incoming_buys = RBTree.empty<(price : Nat), { index : Nat; amount : Nat }>();
     for (incoming in arg.buy_orders.vals()) {
       let incoming_index = RBTree.size(incoming_buys);
@@ -71,8 +62,31 @@ shared (install) persistent actor class Canister(
       };
       incoming_sells := RBTree.insert(incoming_sells, Nat.compare, incoming.price, { incoming with index = incoming_index });
     };
-    switch (RBTree.max(incoming_buys), RBTree.min(incoming_sells)) {
-      case (?(max_buy_price, max_buy), ?(min_sell_price, min_sell)) if (max_buy_price >= min_sell_price) return #Err(#OrdersOverlap { buy_price = max_buy_price; buy_index = max_buy.index; sell_price = min_sell_price; sell_index = min_sell.index });
+    let min_incoming_sell = RBTree.min(incoming_sells);
+    let max_incoming_buy = RBTree.max(incoming_buys);
+    switch (min_incoming_sell, max_incoming_buy) {
+      case (?(max_buy_price, max_buy), ?(min_sell_price, min_sell)) if (max_buy_price >= min_sell_price) {
+        return #Err(#OrdersOverlap { buy_price = max_buy_price; buy_index = max_buy.index; sell_price = min_sell_price; sell_index = min_sell.index });
+      };
+      case _ ();
+    };
+    var user = switch (RBTree.get(users, Principal.compare, caller)) {
+      case (?found) found;
+      case _ Sleepy.newUser(user_ids);
+    };
+    let arg_subaccount = Account.denull(arg.subaccount);
+    var subaccount = switch (RBTree.get(user.subaccounts, Blob.compare, arg_subaccount)) {
+      case (?found) found;
+      case _ Sleepy.newSubaccount(user.subaccount_ids);
+    };
+    let min_own_sell = RBTree.min(subaccount.sells);
+    let max_own_buy = RBTree.max(subaccount.buys);
+    switch (min_incoming_sell, max_own_buy) {
+      case (?(min_incoming_sell_price, min_incoming_sell_detail), ?(max_own_buy_price, _)) if (min_incoming_sell_price <= max_own_buy_price) return #Err(#SellPriceTooLow { min_incoming_sell_detail with price = min_incoming_sell_price; minimum_price = max_own_buy_price }); // todo: move to real min price
+      case _ ();
+    };
+    switch (max_incoming_buy, min_own_sell) {
+      case (?(max_incoming_buy_price, max_incoming_buy_detail), ?(min_own_sell_price, _)) if (max_incoming_buy_price >= min_own_sell_price) return #Err(#BuyPriceTooHigh { max_incoming_buy_detail with price = max_incoming_buy_price; maximum_price = min_own_sell_price }); // todo: move to real max price
       case _ ();
     };
 
