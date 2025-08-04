@@ -2,13 +2,20 @@ import RBTree "../util/motoko/StableCollections/RedBlackTree/RBTree";
 import Result "../util/motoko/Result";
 import ICRC_1_Types "../util/motoko/ICRC-1/Types";
 import Error "../util/motoko/Error";
-import Order "mo:base/Order";
 
 module {
 
   public let SELL_TOKEN = "sleepyswap:sell_token_canister_id";
   public let BUY_TOKEN = "sleepyswap:buy_token_canister_id";
   public let MAX_ORDER_BATCH = "sleepyswap:max_order_batch_size";
+
+  public let AMOUNT_TICK = "sleepyswap:amount_tick";
+  public let PRICE_TICK = "sleepyswap:price_tick";
+  public let MAKER_FEE_NUMER = "sleepyswap:maker_trading_fee_numerator";
+  public let TAKER_FEE_NUMER = "sleepyswap:taker_trading_fee_numerator";
+  public let TRADING_FEE_DENOM = "sleepyswap:trading_fee_denomination";
+  public let MIN_BUY_AMOUNT = "sleepyswap:minimum_buy_amount";
+  public let MIN_SELL_AMOUNT = "sleepyswap:minimum_sell_amount";
 
   public type Order = {
     created_at_time : Nat64;
@@ -93,6 +100,8 @@ module {
   public type PlaceError = {
     #GenericError : Error.Type;
     #BatchTooLarge : { current_batch_size : Nat; maximum_batch_size : Nat };
+    #BuyAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
+    #SellAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
     #DuplicateSellPrice : { price : Nat; indexes : [Nat] };
     #DuplicateBuyPrice : { price : Nat; indexes : [Nat] };
     #OrdersOverlap : {
