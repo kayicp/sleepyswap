@@ -33,23 +33,19 @@ module {
     subaccount : Nat; // user's subaccount id
     is_buy : Bool;
     price : Nat;
-    amount : Nat;
-    remaining : Nat;
-    available : Nat;
+    amount : Nat; // in sell unit
+    locked : Nat;
+    filled : Nat;
     trades : RBTree.Type<Nat, ()>; // trade ids
     close : ?{
       #Canceled : { timestamp : Nat64 };
       #InsufficientFunds : {
-        canister_id : Principal;
-        subaccount : ?Blob;
-        current_balance : Nat;
+        balance : Nat;
         minimum_balance : Nat;
         timestamp : Nat64;
       };
       #InsufficientAllowance : {
-        canister_id : Principal;
-        subaccount : ?Blob;
-        current_allowance : Nat;
+        allowance : Nat;
         minimum_allowance : Nat;
         timestamp : Nat64;
       };
@@ -72,19 +68,25 @@ module {
       transfer : RBTree.Type<Nat64, Call<Nat, ICRC_1_Types.TransferError>>;
     };
   };
+  type Amount = { initial : Nat; locked : Nat; filled : Nat };
+  func newAmount() : Amount = { initial = 0; locked = 0; filled = 0 };
   type Subaccount = {
     id : Nat;
     orders : RBTree.Type<(id : Nat), ()>;
     // note: cant place order on same price
     sells : RBTree.Type<(price : Nat), (order : Nat)>;
+    sell_amount : Amount; // in sell unit
     buys : RBTree.Type<(price : Nat), (order : Nat)>;
+    buy_amount : Amount; // in buy unit
     trades : RBTree.Type<(id : Nat), ()>;
   };
   public func newSubaccount<K>(ids : RBTree.Type<Nat, K>) : Subaccount = {
     id = recycleId(ids);
     orders = RBTree.empty();
     sells = RBTree.empty();
+    sell_amount = newAmount();
     buys = RBTree.empty();
+    buy_amount = newAmount();
     trades = RBTree.empty();
   };
   public type User = {
@@ -111,7 +113,7 @@ module {
   public type PlaceOk = [Nat];
   public type PlaceError = {
     #GenericError : Error.Type;
-    #BatchTooLarge : { current_batch_size : Nat; maximum_batch_size : Nat };
+    #BatchTooLarge : { batch_size : Nat; maximum_batch_size : Nat };
     #BuyAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
     #SellAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
     #BuyPriceTooFar : { price : Nat; index : Nat; nearest_price : Nat };
@@ -132,14 +134,14 @@ module {
     #SellPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
     #SellPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
     #BuyPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
-    #InsufficientBuyFunds : { current_balance : Nat; minimum_balance : Nat };
-    #InsufficienSellFunds : { current_balance : Nat; minimum_balance : Nat };
+    #InsufficientBuyFunds : { balance : Nat; minimum_balance : Nat };
+    #InsufficientSellFunds : { balance : Nat; minimum_balance : Nat };
     #InsufficientBuyAllowance : {
-      current_allowance : Nat;
+      allowance : Nat;
       minimum_allowance : Nat;
     };
     #InsufficientSellAllowance : {
-      current_allowance : Nat;
+      allowance : Nat;
       minimum_allowance : Nat;
     };
     #Duplicate : { duplicate_of : PlaceOk };
@@ -162,6 +164,7 @@ module {
     #equal;
   };
   public func placeCompare(a : PlaceArg, b : PlaceArg) : Order.Order {
+    // todo: add caller
     // todo: add new fields from arg
     var c = Option.compare(a.subaccount, b.subaccount, Blob.compare);
     switch c {
@@ -222,4 +225,5 @@ module {
     let upper = lower + tick;
     if (n - lower <= upper - n) lower else upper;
   };
+
 };

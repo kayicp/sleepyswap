@@ -18,7 +18,7 @@ shared (install) persistent actor class Canister(
   //   #Upgrade;
   // }
 ) = Self {
-  func self() : Principal = Principal.fromActor(Self);
+  // func self() : Principal = Principal.fromActor(Self);
 
   var order_id = 0;
   var orders = RBTree.empty<Nat, Sleepy.Order>();
@@ -47,7 +47,7 @@ shared (install) persistent actor class Canister(
     let batch_size = arg.buy_orders.size() + arg.sell_orders.size();
     if (batch_size == 0) return Error.text("Orders cannot be empty");
     let max_batch = Value.getNat(metadata, Sleepy.MAX_ORDER_BATCH, 0);
-    if (max_batch > 0 and batch_size > max_batch) return #Err(#BatchTooLarge { current_batch_size = batch_size; maximum_batch_size = max_batch });
+    if (max_batch > 0 and batch_size > max_batch) return #Err(#BatchTooLarge { batch_size = batch_size; maximum_batch_size = max_batch });
 
     let sell_token_id = switch (Value.metaPrincipal(metadata, Sleepy.SELL_TOKEN)) {
       case (?found) found;
@@ -102,7 +102,7 @@ shared (install) persistent actor class Canister(
       min_buy_amount := lowest_buy_amount;
       metadata := Value.setNat(metadata, Sleepy.MIN_BUY_AMOUNT, ?min_buy_amount);
     };
-    let lowest_price = lowest_buy_amount / lowest_sell_amount;
+    let lowest_price = min_buy_amount / min_sell_amount;
     var min_price = Value.getNat(metadata, Sleepy.MIN_PRICE, 0);
     if (min_price < lowest_price) {
       min_price := lowest_price;
@@ -118,6 +118,11 @@ shared (install) persistent actor class Canister(
       let nearest_price = Sleepy.nearTick(incoming.price, price_tick);
       if (incoming.price != nearest_price) return #Err(#SellPriceTooFar { incoming with index = incoming_index; nearest_price });
 
+      switch (RBTree.get(incoming_sells, Nat.compare, incoming.price)) {
+        case (?found) return #Err(#DuplicateSellPrice { incoming with indexes = [found.index, incoming_index] });
+        case _ ();
+      };
+
       let min_amount = Nat.max(min_sell_amount, min_buy_amount / incoming.price);
       if (incoming.amount < min_amount) return #Err(#SellAmountTooLow { incoming with index = incoming_index; minimum_amount = min_amount });
 
@@ -125,10 +130,6 @@ shared (install) persistent actor class Canister(
       if (incoming.amount != nearest_amount) return #Err(#SellAmountTooFar { incoming with index = incoming_index; nearest_amount });
 
       total_incoming_sell_amount += incoming.amount;
-      switch (RBTree.get(incoming_sells, Nat.compare, incoming.price)) {
-        case (?found) return #Err(#DuplicateSellPrice { incoming with indexes = [found.index, incoming_index] });
-        case _ ();
-      };
       incoming_sells := RBTree.insert(incoming_sells, Nat.compare, incoming.price, { incoming with index = incoming_index });
     };
 
@@ -141,17 +142,18 @@ shared (install) persistent actor class Canister(
       let nearest_price = Sleepy.nearTick(incoming.price, price_tick);
       if (incoming.price != nearest_price) return #Err(#BuyPriceTooFar { incoming with index = incoming_index; nearest_price });
 
+      switch (RBTree.get(incoming_buys, Nat.compare, incoming.price)) {
+        case (?found) return #Err(#DuplicateBuyPrice { incoming with indexes = [found.index, incoming_index] });
+        case _ ();
+      };
+
       let min_amount = Nat.max(min_sell_amount, min_buy_amount / incoming.price);
       if (incoming.amount < min_amount) return #Err(#BuyAmountTooLow { incoming with index = incoming_index; minimum_amount = min_amount });
 
       let nearest_amount = Sleepy.nearTick(incoming.amount, amount_tick);
       if (incoming.amount != nearest_amount) return #Err(#BuyAmountTooFar { incoming with index = incoming_index; nearest_amount });
 
-      total_incoming_buy_amount += incoming.amount;
-      switch (RBTree.get(incoming_buys, Nat.compare, incoming.price)) {
-        case (?found) return #Err(#DuplicateBuyPrice { incoming with indexes = [found.index, incoming_index] });
-        case _ ();
-      };
+      total_incoming_buy_amount += incoming.amount * incoming.price;
       incoming_buys := RBTree.insert(incoming_buys, Nat.compare, incoming.price, { incoming with index = incoming_index });
     };
     let min_incoming_sell = RBTree.min(incoming_sells);
@@ -160,34 +162,6 @@ shared (install) persistent actor class Canister(
       case (?(min_sell_price, min_sell), ?(max_buy_price, max_buy)) if (max_buy_price >= min_sell_price) {
         return #Err(#OrdersOverlap { buy_price = max_buy_price; buy_index = max_buy.index; sell_price = min_sell_price; sell_index = min_sell.index });
       };
-      case _ ();
-    };
-
-    var user = switch (RBTree.get(users, Principal.compare, caller)) {
-      case (?found) found;
-      case _ Sleepy.newUser(user_ids);
-    };
-    let arg_subaccount = Account.denull(arg.subaccount);
-    var subaccount = switch (RBTree.get(user.subaccounts, Blob.compare, arg_subaccount)) {
-      case (?found) found;
-      case _ Sleepy.newSubaccount(user.subaccount_ids);
-    };
-    let min_own_sell = RBTree.min(subaccount.sells);
-    let max_own_buy = RBTree.max(subaccount.buys);
-    switch (min_incoming_sell, max_own_buy) {
-      case (?(min_incoming_sell_price, min_incoming_sell_detail), ?(max_own_buy_price, _)) if (min_incoming_sell_price <= max_own_buy_price) return #Err(#SellPriceTooLow { min_incoming_sell_detail with price = min_incoming_sell_price; minimum_price = max_own_buy_price });
-      case _ ();
-    };
-    switch (max_incoming_buy, min_own_sell) {
-      case (?(max_incoming_buy_price, max_incoming_buy_detail), ?(min_own_sell_price, _)) if (max_incoming_buy_price >= min_own_sell_price) return #Err(#BuyPriceTooHigh { max_incoming_buy_detail with price = max_incoming_buy_price; maximum_price = min_own_sell_price });
-      case _ ();
-    };
-    for ((incoming_price, incoming_detail) in RBTree.entries(incoming_sells)) switch (RBTree.get(subaccount.sells, Nat.compare, incoming_price)) {
-      case (?found) return #Err(#SellPriceOccupied { incoming_detail with price = incoming_price; order_id = found });
-      case _ ();
-    };
-    for ((incoming_price, incoming_detail) in RBTree.entries(incoming_buys)) switch (RBTree.get(subaccount.buys, Nat.compare, incoming_price)) {
-      case (?found) return #Err(#BuyPriceOccupied { incoming_detail with price = incoming_price; order_id = found });
       case _ ();
     };
 
@@ -219,6 +193,64 @@ shared (install) persistent actor class Canister(
       };
       case _ ();
     };
+
+    let arg_subaccount = Account.denull(arg.subaccount);
+    var user = switch (RBTree.get(users, Principal.compare, caller)) {
+      case (?found) found;
+      case _ Sleepy.newUser(user_ids);
+    };
+    var subaccount = switch (RBTree.get(user.subaccounts, Blob.compare, arg_subaccount)) {
+      case (?found) found;
+      case _ Sleepy.newSubaccount(user.subaccount_ids);
+    };
+    let min_own_sell = RBTree.min(subaccount.sells);
+    let max_own_buy = RBTree.max(subaccount.buys);
+    switch (min_incoming_sell, max_own_buy) {
+      case (?(min_incoming_sell_price, min_incoming_sell_detail), ?(max_own_buy_price, _)) if (min_incoming_sell_price <= max_own_buy_price) return #Err(#SellPriceTooLow { min_incoming_sell_detail with price = min_incoming_sell_price; minimum_price = max_own_buy_price });
+      case _ ();
+    };
+    switch (max_incoming_buy, min_own_sell) {
+      case (?(max_incoming_buy_price, max_incoming_buy_detail), ?(min_own_sell_price, _)) if (max_incoming_buy_price >= min_own_sell_price) return #Err(#BuyPriceTooHigh { max_incoming_buy_detail with price = max_incoming_buy_price; maximum_price = min_own_sell_price });
+      case _ ();
+    };
+    for ((incoming_price, incoming_detail) in RBTree.entries(incoming_sells)) switch (RBTree.get(subaccount.sells, Nat.compare, incoming_price)) {
+      case (?found) return #Err(#SellPriceOccupied { incoming_detail with price = incoming_price; order_id = found });
+      case _ ();
+    };
+    for ((incoming_price, incoming_detail) in RBTree.entries(incoming_buys)) switch (RBTree.get(subaccount.buys, Nat.compare, incoming_price)) {
+      case (?found) return #Err(#BuyPriceOccupied { incoming_detail with price = incoming_price; order_id = found });
+      case _ ();
+    };
+
+    let self = Principal.fromActor(Self);
+    let self_account = { owner = self; subaccount = null };
+    let self_approval = { account = user_account; spender = self_account };
+
+    let sell_amount = subaccount.sell_amount;
+    let min_sell_balance_approval = (sell_amount.initial - sell_amount.filled) + total_incoming_sell_amount;
+    let sell_balance_approval_res = if (min_sell_balance_approval > 0) ?(sell_token.icrc1_balance_of(user_account), sell_token.icrc2_allowance(self_approval)) else null;
+
+    let buy_amount = subaccount.buy_amount;
+    let min_buy_balance_approval = (buy_amount.initial - buy_amount.filled) + total_incoming_buy_amount;
+    let buy_balance_approval_res = if (min_buy_balance_approval > 0) ?(buy_token.icrc1_balance_of(user_account), buy_token.icrc2_allowance(self_approval)) else null;
+
+    switch sell_balance_approval_res {
+      case (?(balance_res, approval_res)) {
+        let (balance, approval) = (await balance_res, await approval_res);
+        if (balance < min_sell_balance_approval) return #Err(#InsufficientSellFunds { balance; minimum_balance = min_sell_balance_approval });
+        if (approval.allowance < min_sell_balance_approval) return #Err(#InsufficientSellAllowance { approval with minimum_allowance = min_sell_balance_approval });
+      };
+      case _ ();
+    };
+    switch buy_balance_approval_res {
+      case (?(balance_res, approval_res)) {
+        let (balance, approval) = (await balance_res, await approval_res);
+        if (balance < min_buy_balance_approval) return #Err(#InsufficientBuyFunds { balance; minimum_balance = min_buy_balance_approval });
+        if (approval.allowance < min_buy_balance_approval) return #Err(#InsufficientBuyAllowance { approval with minimum_allowance = min_buy_balance_approval });
+      };
+      case _ ();
+    };
+
     #Ok([]);
   } catch e Error.error(e);
 
