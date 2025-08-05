@@ -2,6 +2,12 @@ import RBTree "../util/motoko/StableCollections/RedBlackTree/RBTree";
 import Result "../util/motoko/Result";
 import ICRC_1_Types "../util/motoko/ICRC-1/Types";
 import Error "../util/motoko/Error";
+import Order "mo:base/Order";
+import Blob "mo:base/Blob";
+import Nat64 "mo:base/Nat64";
+import Nat "mo:base/Nat";
+import Iter "mo:base/Iter";
+import Option "../util/motoko/Option";
 
 module {
 
@@ -16,6 +22,10 @@ module {
   public let TRADING_FEE_DENOM = "sleepyswap:trading_fee_denomination";
   public let MIN_BUY_AMOUNT = "sleepyswap:minimum_buy_amount";
   public let MIN_SELL_AMOUNT = "sleepyswap:minimum_sell_amount";
+  public let MIN_PRICE = "sleepyswap:minimum_price";
+
+  public let TX_WINDOW = "sleepyswap:tx_window";
+  public let PERMITTED_DRIFT = "sleepyswap:permitted_drift";
 
   public type Order = {
     created_at_time : Nat64;
@@ -91,17 +101,23 @@ module {
   };
   type OrderArg = { price : Nat; amount : Nat };
   public type PlaceArg = {
-    // payment
+    // todo: payment, add to placeCompare
     subaccount : ?Blob;
     created_at_time : ?Nat64;
+    memo : ?Blob;
     buy_orders : [OrderArg];
     sell_orders : [OrderArg];
   };
+  public type PlaceOk = [Nat];
   public type PlaceError = {
     #GenericError : Error.Type;
     #BatchTooLarge : { current_batch_size : Nat; maximum_batch_size : Nat };
     #BuyAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
     #SellAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
+    #BuyPriceTooFar : { price : Nat; index : Nat; nearest_price : Nat };
+    #SellPriceTooFar : { price : Nat; index : Nat; nearest_price : Nat };
+    #BuyAmountTooFar : { price : Nat; index : Nat; nearest_amount : Nat };
+    #SellAmountTooFar : { price : Nat; index : Nat; nearest_amount : Nat };
     #DuplicateSellPrice : { price : Nat; indexes : [Nat] };
     #DuplicateBuyPrice : { price : Nat; indexes : [Nat] };
     #OrdersOverlap : {
@@ -114,8 +130,8 @@ module {
     #SellPriceTooHigh : { price : Nat; index : Nat; maximum_price : Nat };
     #BuyPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
     #SellPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
-    #ExistingSellPrice : { price : Nat; index : Nat; order_id : Nat };
-    #ExistingBuyPrice : { price : Nat; index : Nat; order_id : Nat };
+    #SellPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
+    #BuyPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
     #InsufficientBuyFunds : { current_balance : Nat; minimum_balance : Nat };
     #InsufficienSellFunds : { current_balance : Nat; minimum_balance : Nat };
     #InsufficientBuyAllowance : {
@@ -126,11 +142,68 @@ module {
       current_allowance : Nat;
       minimum_allowance : Nat;
     };
-    #Duplicate : { duplicate_of : Nat };
+    #Duplicate : { duplicate_of : PlaceOk };
     #CreatedInFuture : { ledger_time : Nat64 };
     #TooOld;
   };
-  public type PlaceResult = Result.Type<[Nat], PlaceError>;
+  public type PlaceResult = Result.Type<PlaceOk, PlaceError>;
+
+  func orderCompare(a : OrderArg, b : OrderArg) : Order.Order {
+    var c = Nat.compare(a.price, b.price);
+    switch c {
+      case (#equal) ();
+      case _ return c;
+    };
+    c := Nat.compare(a.amount, b.amount);
+    switch c {
+      case (#equal) ();
+      case _ return c;
+    };
+    #equal;
+  };
+  public func placeCompare(a : PlaceArg, b : PlaceArg) : Order.Order {
+    // todo: add new fields from arg
+    var c = Option.compare(a.subaccount, b.subaccount, Blob.compare);
+    switch c {
+      case (#equal) ();
+      case _ return c;
+    };
+    c := Option.compare(a.created_at_time, b.created_at_time, Nat64.compare);
+    switch c {
+      case (#equal) ();
+      case _ return c;
+    };
+    c := Option.compare(a.memo, b.memo, Blob.compare);
+    switch c {
+      case (#equal) ();
+      case _ return c;
+    };
+    c := Nat.compare(a.buy_orders.size(), b.buy_orders.size());
+    switch c {
+      case (#equal) ();
+      case _ return c;
+    };
+    c := Nat.compare(a.sell_orders.size(), b.sell_orders.size());
+    switch c {
+      case (#equal) ();
+      case _ return c;
+    };
+    for (i in Iter.range(0, a.buy_orders.size() - 1)) {
+      c := orderCompare(a.buy_orders[i], b.buy_orders[i]);
+      switch c {
+        case (#equal) ();
+        case _ return c;
+      };
+    };
+    for (i in Iter.range(0, a.sell_orders.size() - 1)) {
+      c := orderCompare(a.sell_orders[i], b.sell_orders[i]);
+      switch c {
+        case (#equal) ();
+        case _ return c;
+      };
+    };
+    #equal;
+  };
 
   public type CancelArg = [{ id : Nat; subaccount : ?Blob }];
   public type CancelError = {
@@ -142,5 +215,11 @@ module {
   public func recycleId<K>(ids : RBTree.Type<Nat, K>) : Nat = switch (RBTree.minKey(ids), RBTree.maxKey(ids)) {
     case (?min_id, ?max_id) if (min_id > 0) min_id - 1 else max_id + 1;
     case _ 0;
+  };
+
+  public func nearTick(n : Nat, tick : Nat) : Nat {
+    let lower = (n / tick) * tick;
+    let upper = lower + tick;
+    if (n - lower <= upper - n) lower else upper;
   };
 };
