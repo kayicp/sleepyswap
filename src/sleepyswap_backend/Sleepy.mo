@@ -7,6 +7,7 @@ import Blob "mo:base/Blob";
 import Nat64 "mo:base/Nat64";
 import Nat "mo:base/Nat";
 import Iter "mo:base/Iter";
+import Principal "mo:base/Principal";
 import Option "../util/motoko/Option";
 
 module {
@@ -23,6 +24,21 @@ module {
   public let MIN_BUY_AMOUNT = "sleepyswap:minimum_buy_amount";
   public let MIN_SELL_AMOUNT = "sleepyswap:minimum_sell_amount";
   public let MIN_PRICE = "sleepyswap:minimum_price";
+  public let TTL = "sleepyswap:time_to_live";
+  public let DEFAULT_EXPIRY = "sleepyswap:default_expiry";
+  public let MAX_EXPIRY = "sleepyswap:max_expiry";
+  public let AUTH = "sleepyswap:authorization";
+  /*
+    authorization
+    - None
+      - place
+        - global_rate_limit
+    - Credit
+      - place
+        - rate_limit
+    - ICRC2
+      map(canister id, amount)
+  */
 
   public let TX_WINDOW = "sleepyswap:tx_window";
   public let PERMITTED_DRIFT = "sleepyswap:permitted_drift";
@@ -80,33 +96,40 @@ module {
     buy_amount : Amount; // in buy unit
     trades : RBTree.Type<(id : Nat), ()>;
   };
-  public func newSubaccount<K>(ids : RBTree.Type<Nat, K>) : Subaccount = {
-    id = recycleId(ids);
-    orders = RBTree.empty();
-    sells = RBTree.empty();
-    sell_amount = newAmount();
-    buys = RBTree.empty();
-    buy_amount = newAmount();
-    trades = RBTree.empty();
+  type Subaccounts = RBTree.Type<Blob, Subaccount>;
+  public func getSubaccount<K>(user : User, subaccount : Blob) : Subaccount = switch (RBTree.get(user.subaccounts, Blob.compare, subaccount)) {
+    case (?found) found;
+    case _ ({
+      id = recycleId(user.subaccount_ids);
+      orders = RBTree.empty();
+      sells = RBTree.empty();
+      sell_amount = newAmount();
+      buys = RBTree.empty();
+      buy_amount = newAmount();
+      trades = RBTree.empty();
+    });
+  };
+  public func saveSubaccount(user : User, subaccount_b : Blob, subaccount : Subaccount) : User = {
+    user with
+    subaccounts = RBTree.insert(user.subaccounts, Blob.compare, subaccount_b, subaccount);
+    subaccount_ids = RBTree.insert(user.subaccount_ids, Nat.compare, subaccount.id, subaccount_b);
   };
   public type User = {
     id : Nat;
     credit : Nat;
+    place_locked : ?Nat64;
     subaccounts : RBTree.Type<Blob, Subaccount>;
     subaccount_ids : RBTree.Type<Nat, Blob>;
   };
-  public func newUser<K>(ids : RBTree.Type<Nat, K>) : User = {
-    id = recycleId(ids);
-    credit = 0;
-    subaccounts = RBTree.empty();
-    subaccount_ids = RBTree.empty();
-  };
-  type OrderArg = { price : Nat; amount : Nat };
+  public type Users = RBTree.Type<Principal, User>;
+
+  type OrderArg = { price : Nat; amount : Nat; expires_at : ?Nat64 };
   public type PlaceArg = {
     // todo: payment, add to placeCompare
     subaccount : ?Blob;
     created_at_time : ?Nat64;
-    memo : ?Blob;
+    memo : ?Blob; // todo: check memo
+    authorization : ?Authorization; // if not set, it's auto
     buy_orders : [OrderArg];
     sell_orders : [OrderArg];
   };
@@ -134,6 +157,7 @@ module {
     #SellPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
     #SellPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
     #BuyPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
+    #Locked : { timestamp : Nat64 };
     #InsufficientBuyFunds : { balance : Nat; minimum_balance : Nat };
     #InsufficientSellFunds : { balance : Nat; minimum_balance : Nat };
     #InsufficientBuyAllowance : {
@@ -166,6 +190,7 @@ module {
   public func placeCompare(a : PlaceArg, b : PlaceArg) : Order.Order {
     // todo: add caller
     // todo: add new fields from arg
+    // todo: should created_at_time be first check for easier trim
     var c = Option.compare(a.subaccount, b.subaccount, Blob.compare);
     switch c {
       case (#equal) ();
@@ -226,4 +251,10 @@ module {
     if (n - lower <= upper - n) lower else upper;
   };
 
+  public type Authorization = {
+    #None;
+    #Credit;
+    #ICRC2 : { canister_id : Principal; amount : ?Nat };
+    #Custom : [Authorization];
+  };
 };
