@@ -12,8 +12,8 @@ import Option "../util/motoko/Option";
 
 module {
 
-  public let SELL_TOKEN = "sleepyswap:sell_token_canister_id";
-  public let BUY_TOKEN = "sleepyswap:buy_token_canister_id";
+  public let SELL_TOKEN = "sleepyswap:sell_icrc2_canister_id";
+  public let BUY_TOKEN = "sleepyswap:buy_icrc2_canister_id";
   public let MAX_ORDER_BATCH = "sleepyswap:max_order_batch_size";
 
   public let AMOUNT_TICK = "sleepyswap:amount_tick";
@@ -27,18 +27,9 @@ module {
   public let TTL = "sleepyswap:time_to_live";
   public let DEFAULT_EXPIRY = "sleepyswap:default_expiry";
   public let MAX_EXPIRY = "sleepyswap:max_expiry";
-  public let AUTH = "sleepyswap:authorization";
-  /*
-    authorization
-    - None
-      - place
-        - global_rate_limit
-    - Credit
-      - place
-        - rate_limit
-    - ICRC2
-      map(canister id, amount)
-  */
+  public let AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT = "sleepyswap:auth_none_place_global_rate_limit";
+  public let AUTH_CREDIT_PLACE_RATE_LIMIT = "sleepyswap:auth_credit_place_rate_limit";
+  public let AUTH_ICRC2_CANISTER_IDS = "sleepyswap:auth_icrc2_canister_ids";
 
   public let TX_WINDOW = "sleepyswap:tx_window";
   public let PERMITTED_DRIFT = "sleepyswap:permitted_drift";
@@ -251,10 +242,43 @@ module {
     if (n - lower <= upper - n) lower else upper;
   };
 
+  type ICRC2_Auth = { canister_id : Principal; amount : ?Nat };
   public type Authorization = {
     #None;
     #Credit;
-    #ICRC2 : { canister_id : Principal; amount : ?Nat };
-    #Custom : [Authorization];
+    #ICRC2 : ICRC2_Auth;
+    // #Custom : { options : [{ #None; #Credit; #ICRC2 : ICRC2_Auth }] };
+  };
+  public type Authorized = {
+    #None;
+    #Credit;
+    #ICRC2 : { canister_id : Principal; xfer : Nat };
+  };
+  type TempUnavailable = { time : Nat64; available_time : Nat64 };
+  type None_Failure = {
+    #TemporarilyUnavailable : TempUnavailable;
+  };
+  type Credit_Failure = {
+    #TemporarilyUnavailable : TempUnavailable;
+    #InsufficientCredit;
+  };
+  type ICRC2_Failure = {
+    #BadCanister : { expected_canister_ids : [Principal] };
+    #BadAmount : { expected_amount : Nat };
+    #TransferFromFailed : ICRC_1_Types.TransferFromError;
+  };
+  type Auto_Failure = {
+    failures : [{
+      #None : None_Failure;
+      #Credit : Credit_Failure;
+      #ICRC2 : ICRC2_Failure;
+    }];
+  };
+  public type Unauthorized = {
+    #None : None_Failure;
+    #Credit : Credit_Failure;
+    #ICRC2 : ICRC2_Failure;
+    #Automatic : Auto_Failure;
+    // #Custom : Auto_Failure;
   };
 };

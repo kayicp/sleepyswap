@@ -260,6 +260,8 @@ shared (install) persistent actor class Canister(
       // user := getUser(caller);
       // subaccount := Sleepy.getSubaccount(user, arg_subaccount);
 
+      // todo: check expiry
+      // todo: check auth
       // todo: trim users
       // todo: trim dedupes
       #Ok([]);
