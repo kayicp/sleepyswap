@@ -8,7 +8,9 @@ import Nat64 "mo:base/Nat64";
 import Nat "mo:base/Nat";
 import Iter "mo:base/Iter";
 import Principal "mo:base/Principal";
+import Text "mo:base/Text";
 import Option "../util/motoko/Option";
+import Value "../util/motoko/Value";
 
 module {
 
@@ -27,12 +29,15 @@ module {
   public let TTL = "sleepyswap:time_to_live";
   public let DEFAULT_EXPIRY = "sleepyswap:default_expiry";
   public let MAX_EXPIRY = "sleepyswap:max_expiry";
-  public let AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT = "sleepyswap:auth_none_place_global_rate_limit";
-  public let AUTH_CREDIT_PLACE_RATE_LIMIT = "sleepyswap:auth_credit_place_rate_limit";
-  public let AUTH_ICRC2_CANISTER_IDS = "sleepyswap:auth_icrc2_canister_ids";
+  public let MIN_EXPIRY = "sleepyswap:min_expiry";
+  public let AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT = "sleepyswap:auth_none_place_global_rate_limit"; // millisecond
+  public let AUTH_CREDIT_PLACE_RATE_LIMIT = "sleepyswap:auth_credit_place_rate_limit"; // millisecond
+  public let AUTH_ICRC2_RATES = "sleepyswap:auth_icrc2_rates"; // map(canisterid, map("place", amount))
 
   public let TX_WINDOW = "sleepyswap:tx_window";
   public let PERMITTED_DRIFT = "sleepyswap:permitted_drift";
+
+  // todo: memo size
 
   public type Order = {
     created_at_time : Nat64;
@@ -107,7 +112,8 @@ module {
   };
   public type User = {
     id : Nat;
-    credit : Nat;
+    credit : Nat; // todo: credit last updated
+    credit_last_updated : Nat64;
     place_locked : ?Nat64;
     subaccounts : RBTree.Type<Blob, Subaccount>;
     subaccount_ids : RBTree.Type<Nat, Blob>;
@@ -128,6 +134,16 @@ module {
   public type PlaceError = {
     #GenericError : Error.Type;
     #BatchTooLarge : { batch_size : Nat; maximum_batch_size : Nat };
+    #ExpiresTooSoon : {
+      expires_at : Nat64;
+      index : Nat;
+      minimum_expires_at : Nat64;
+    };
+    #ExpiresTooLate : {
+      expires_at : Nat64;
+      index : Nat;
+      maximum_expires_at : Nat64;
+    };
     #BuyAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
     #SellAmountTooLow : { amount : Nat; index : Nat; minimum_amount : Nat };
     #BuyPriceTooFar : { price : Nat; index : Nat; nearest_price : Nat };
@@ -146,8 +162,9 @@ module {
     #SellPriceTooHigh : { price : Nat; index : Nat; maximum_price : Nat };
     #BuyPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
     #SellPriceTooLow : { price : Nat; index : Nat; minimum_price : Nat };
-    #SellPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
-    #BuyPriceOccupied : { price : Nat; index : Nat; order_id : Nat };
+    #SellPriceUnavailable : { price : Nat; index : Nat; order_id : Nat };
+    #BuyPriceUnavailable : { price : Nat; index : Nat; order_id : Nat };
+    #Unauthorized : Unauthorized;
     #Locked : { timestamp : Nat64 };
     #InsufficientBuyFunds : { balance : Nat; minimum_balance : Nat };
     #InsufficientSellFunds : { balance : Nat; minimum_balance : Nat };
@@ -254,31 +271,61 @@ module {
     #Credit;
     #ICRC2 : { canister_id : Principal; xfer : Nat };
   };
-  type TempUnavailable = { time : Nat64; available_time : Nat64 };
   type None_Failure = {
-    #TemporarilyUnavailable : TempUnavailable;
+    #TemporarilyUnavailable : {
+      time : Nat64;
+      available_time : Nat64;
+      used_by : Principal;
+    };
   };
   type Credit_Failure = {
-    #TemporarilyUnavailable : TempUnavailable;
-    #InsufficientCredit;
+    #TemporarilyUnavailable : { time : Nat64; available_time : Nat64 };
+    #OutOfCredit;
   };
   type ICRC2_Failure = {
-    #BadCanister : { expected_canister_ids : [Principal] };
-    #BadAmount : { expected_amount : Nat };
+    #BadCanister : {
+      canister_id : Principal;
+      expected_canister_ids : [Principal];
+    };
+    #BadAmount : { amount : Nat; expected_amount : Nat };
     #TransferFromFailed : ICRC_1_Types.TransferFromError;
   };
-  type Auto_Failure = {
-    failures : [{
-      #None : None_Failure;
-      #Credit : Credit_Failure;
-      #ICRC2 : ICRC2_Failure;
-    }];
+  public type Auto_Failure = {
+    #None : None_Failure;
+    #Credit : Credit_Failure;
+    #ICRC2 : ICRC2_Failure;
   };
   public type Unauthorized = {
     #None : None_Failure;
     #Credit : Credit_Failure;
     #ICRC2 : ICRC2_Failure;
-    #Automatic : Auto_Failure;
+    #Automatic : { failures : [Auto_Failure] };
     // #Custom : Auto_Failure;
   };
+
+  public func authNoneCheck(now : Nat64, none_available_time : Nat64, last_placer : Principal) : Result.Type<(), { #Unauthorized : Unauthorized }> = if (now < none_available_time) return #Err(#Unauthorized(#None(#TemporarilyUnavailable { time = now; available_time = none_available_time; used_by = last_placer }))) else #Ok;
+
+  public func authCreditCheck(user : User, now : Nat64, credit_available_time : Nat64) : Result.Type<(), { #Unauthorized : Unauthorized }> {
+    if (user.credit == 0) return #Err(#Unauthorized(#Credit(#OutOfCredit)));
+
+    if (now < credit_available_time) return #Err(#Unauthorized(#Credit(#TemporarilyUnavailable { time = now; available_time = credit_available_time })));
+    #Ok;
+  };
+
+  public func authIcrc2Check(icrc2_rates : RBTree.Type<Principal, Value.Type>, auth : ICRC2_Auth) : Result.Type<(), { #Unauthorized : Unauthorized; #GenericError : Error.Type }> {
+    let rates = switch (RBTree.get(icrc2_rates, Principal.compare, auth.canister_id)) {
+      case (?#Map found) RBTree.fromArray(found, Text.compare);
+      case _ return #Err(#Unauthorized(#ICRC2(#BadCanister { auth with expected_canister_ids = RBTree.arrayKey(icrc2_rates) })));
+    };
+    let expected_amount = Value.getNat(rates, "place", 0);
+    if (expected_amount == 0) return Error.text("Metadata `" # AUTH_ICRC2_RATES # "." # Principal.toText(auth.canister_id) # ".place` is not properly set");
+
+    switch (auth.amount) {
+      case (?amount) if (amount != expected_amount) return #Err(#Unauthorized(#ICRC2(#BadAmount { amount; expected_amount })));
+      case _ ();
+    };
+
+    #Ok;
+  };
+
 };

@@ -3,6 +3,8 @@ import Nat "mo:base/Nat";
 import Blob "mo:base/Blob";
 import Nat8 "mo:base/Nat8";
 import Nat64 "mo:base/Nat64";
+import Buffer "mo:base/Buffer";
+import Text "mo:base/Text";
 import Sleepy "Sleepy";
 
 import RBTree "../util/motoko/StableCollections/RedBlackTree/RBTree";
@@ -11,6 +13,8 @@ import Value "../util/motoko/Value";
 import Error "../util/motoko/Error";
 import Account "../util/motoko/ICRC-1/Account";
 import ICRC_1_Types "../util/motoko/ICRC-1/Types";
+import Option "../util/motoko/Option";
+import Management "../util/motoko/Management";
 
 shared (install) persistent actor class Canister(
   // deploy : {
@@ -32,6 +36,9 @@ shared (install) persistent actor class Canister(
 
   var user_ids = RBTree.empty<Nat, Principal>();
   var users = RBTree.empty<Principal, Sleepy.User>();
+
+  var last_placed = 0 : Nat64;
+  var last_placer = Management.principal();
 
   var place_dedupes = RBTree.empty<Sleepy.PlaceArg, Sleepy.PlaceOk>();
 
@@ -57,11 +64,11 @@ shared (install) persistent actor class Canister(
     try {
       let sell_token_id = switch (Value.metaPrincipal(metadata, Sleepy.SELL_TOKEN)) {
         case (?found) found;
-        case _ return Error.text("Metadata `" # Sleepy.SELL_TOKEN # "` is not set");
+        case _ return Error.text("Metadata `" # Sleepy.SELL_TOKEN # "` is not properly set");
       };
       let buy_token_id = switch (Value.metaPrincipal(metadata, Sleepy.BUY_TOKEN)) {
         case (?found) found;
-        case _ return Error.text("Metadata `" # Sleepy.BUY_TOKEN # "` is not set");
+        case _ return Error.text("Metadata `" # Sleepy.BUY_TOKEN # "` is not properly set");
       };
       let (sell_token, buy_token) = (ICRC_1_Types.genActor(sell_token_id), ICRC_1_Types.genActor(buy_token_id));
 
@@ -115,10 +122,47 @@ shared (install) persistent actor class Canister(
         metadata := Value.setNat(metadata, Sleepy.MIN_PRICE, ?min_price);
       };
 
+      var max_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.MAX_EXPIRY, 0)));
+      let lowest_max_expiry = Time64.HOURS(24);
+      let highest_max_expiry = lowest_max_expiry * 30;
+      if (max_expiry < lowest_max_expiry) {
+        max_expiry := lowest_max_expiry;
+        metadata := Value.setNat(metadata, Sleepy.MAX_EXPIRY, ?(Nat64.toNat(lowest_max_expiry / 1_000_000_000)));
+      } else if (max_expiry > highest_max_expiry) {
+        max_expiry := highest_max_expiry;
+        metadata := Value.setNat(metadata, Sleepy.MAX_EXPIRY, ?(Nat64.toNat(highest_max_expiry / 1_000_000_000)));
+      };
+
+      var min_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.MIN_EXPIRY, 0)));
+      let lowest_min_expiry = Time64.HOURS(1);
+      let max_expiry_seconds = Nat64.toNat(max_expiry / 1_000_000_000);
+      if (min_expiry < lowest_min_expiry) {
+        min_expiry := lowest_min_expiry;
+        metadata := Value.setNat(metadata, Sleepy.MIN_EXPIRY, ?(Nat64.toNat(min_expiry / 1_000_000_000)));
+      } else if (min_expiry > max_expiry) {
+        min_expiry := max_expiry;
+        metadata := Value.setNat(metadata, Sleepy.DEFAULT_EXPIRY, ?max_expiry_seconds);
+      };
+
+      var default_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.DEFAULT_EXPIRY, 0)));
+      if (default_expiry < min_expiry or default_expiry > max_expiry) {
+        default_expiry := (min_expiry + max_expiry) / 2;
+        metadata := Value.setNat(metadata, Sleepy.DEFAULT_EXPIRY, ?(Nat64.toNat(default_expiry / 1_000_000_000)));
+      };
+
+      let now = Time64.nanos();
+      let max_expires_at = now + max_expiry;
+      let min_expires_at = now + min_expiry;
+      let default_expires_at = now + default_expiry;
       var total_incoming_sell_amount = 0;
       var incoming_sells = RBTree.empty<(price : Nat), { index : Nat; amount : Nat }>();
       for (incoming in arg.sell_orders.vals()) {
         let incoming_index = RBTree.size(incoming_sells);
+
+        let incoming_expires_at = Option.fallback(incoming.expires_at, default_expires_at);
+        if (incoming_expires_at < min_expires_at) return #Err(#ExpiresTooSoon { expires_at = incoming_expires_at; index = incoming_index; minimum_expires_at = min_expires_at });
+        if (incoming_expires_at > max_expires_at) return #Err(#ExpiresTooLate { expires_at = incoming_expires_at; index = incoming_index; maximum_expires_at = max_expires_at });
+
         if (incoming.price < min_price) return #Err(#SellPriceTooLow { incoming with index = incoming_index; minimum_price = min_price });
 
         let nearest_price = Sleepy.nearTick(incoming.price, price_tick);
@@ -185,12 +229,42 @@ shared (install) persistent actor class Canister(
         case _ ();
       };
       for ((incoming_price, incoming_detail) in RBTree.entries(incoming_sells)) switch (RBTree.get(subaccount.sells, Nat.compare, incoming_price)) {
-        case (?found) return #Err(#SellPriceOccupied { incoming_detail with price = incoming_price; order_id = found });
+        case (?found) return #Err(#SellPriceUnavailable { incoming_detail with price = incoming_price; order_id = found });
         case _ ();
       };
       for ((incoming_price, incoming_detail) in RBTree.entries(incoming_buys)) switch (RBTree.get(subaccount.buys, Nat.compare, incoming_price)) {
-        case (?found) return #Err(#BuyPriceOccupied { incoming_detail with price = incoming_price; order_id = found });
+        case (?found) return #Err(#BuyPriceUnavailable { incoming_detail with price = incoming_price; order_id = found });
         case _ ();
+      };
+
+      let min_rate_limit = Time64.MILLI(10);
+      var none_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT, 0)));
+      if (none_rate_limit < min_rate_limit) {
+        none_rate_limit := min_rate_limit;
+        metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT, ?10);
+      };
+      var credit_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_CREDIT_PLACE_RATE_LIMIT, 0)));
+      if (credit_rate_limit < min_rate_limit) {
+        credit_rate_limit := min_rate_limit;
+        metadata := Value.setNat(metadata, Sleepy.AUTH_CREDIT_PLACE_RATE_LIMIT, ?10);
+      };
+      let icrc2_rates = Value.getPrincipalMap(metadata, Sleepy.AUTH_ICRC2_RATES, RBTree.empty());
+      if (RBTree.size(icrc2_rates) == 0) return Error.text("Metadata `" # Sleepy.AUTH_ICRC2_RATES # "` is not properly set");
+
+      let none_available_time = last_placed + none_rate_limit;
+      let credit_available_time = user.credit_last_updated + credit_rate_limit;
+      let auto_errors = Buffer.Buffer<Sleepy.Auto_Failure>(5); // none, credit, eepy, icp, ckbtc
+
+      let selected_auth = switch (arg.authorization) {
+        case (?#None) switch (Sleepy.authNoneCheck(now, none_available_time, last_placer)) {
+          case (#Err err) return #Err(err);
+          case _ #None;
+        };
+        case (?#Credit) switch (Sleepy.authCreditCheck(user, now, credit_available_time)) {
+          case (#Err err) return #Err(err);
+          case _ #Credit;
+        };
+        case (?#ICRC2 payment) switch (Sleepy.);
       };
 
       var tx_window = Nat64.fromNat(Value.getNat(metadata, Sleepy.TX_WINDOW, 0));
@@ -207,7 +281,6 @@ shared (install) persistent actor class Canister(
         metadata := Value.setNat(metadata, Sleepy.PERMITTED_DRIFT, ?(Nat64.toNat(permitted_drift)));
       };
 
-      let now = Time64.nanos();
       switch (arg.created_at_time) {
         case (?created_time) {
           let start_time = now - tx_window - permitted_drift;
@@ -221,7 +294,6 @@ shared (install) persistent actor class Canister(
         };
         case _ ();
       };
-      // todo: trim dedupes
 
       switch (user.place_locked) {
         case (?locked_at) return #Err(#Locked { timestamp = locked_at });
@@ -257,10 +329,19 @@ shared (install) persistent actor class Canister(
       if (buy_balance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyFunds { balance = buy_balance; minimum_balance = min_buy_balance_approval }));
       if (buy_approval.allowance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyAllowance { buy_approval with minimum_allowance = min_buy_balance_approval }));
 
+      switch (arg.authorization) {
+        case (?(#ICRC2 specified)) {
+
+        };
+        case (?#None or ?#Credit) (); // already checked
+        case (null) {
+          // automatic icrc2
+        };
+      };
+
       // user := getUser(caller);
       // subaccount := Sleepy.getSubaccount(user, arg_subaccount);
 
-      // todo: check expiry
       // todo: check auth
       // todo: trim users
       // todo: trim dedupes
