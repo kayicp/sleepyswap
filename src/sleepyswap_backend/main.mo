@@ -5,6 +5,7 @@ import Nat8 "mo:base/Nat8";
 import Nat64 "mo:base/Nat64";
 import Buffer "mo:base/Buffer";
 import Text "mo:base/Text";
+import Option "mo:base/Option";
 import Sleepy "Sleepy";
 
 import RBTree "../util/motoko/StableCollections/RedBlackTree/RBTree";
@@ -13,7 +14,6 @@ import Value "../util/motoko/Value";
 import Error "../util/motoko/Error";
 import Account "../util/motoko/ICRC-1/Account";
 import ICRC_1_Types "../util/motoko/ICRC-1/Types";
-import Option "../util/motoko/Option";
 import Management "../util/motoko/Management";
 
 shared (install) persistent actor class Canister(
@@ -159,7 +159,7 @@ shared (install) persistent actor class Canister(
       for (incoming in arg.sell_orders.vals()) {
         let incoming_index = RBTree.size(incoming_sells);
 
-        let incoming_expires_at = Option.fallback(incoming.expires_at, default_expires_at);
+        let incoming_expires_at = Option.get(incoming.expires_at, default_expires_at);
         if (incoming_expires_at < min_expires_at) return #Err(#ExpiresTooSoon { expires_at = incoming_expires_at; index = incoming_index; minimum_expires_at = min_expires_at });
         if (incoming_expires_at > max_expires_at) return #Err(#ExpiresTooLate { expires_at = incoming_expires_at; index = incoming_index; maximum_expires_at = max_expires_at });
 
@@ -248,23 +248,38 @@ shared (install) persistent actor class Canister(
         credit_rate_limit := min_rate_limit;
         metadata := Value.setNat(metadata, Sleepy.AUTH_CREDIT_PLACE_RATE_LIMIT, ?10);
       };
-      let icrc2_rates = Value.getPrincipalMap(metadata, Sleepy.AUTH_ICRC2_RATES, RBTree.empty());
-      if (RBTree.size(icrc2_rates) == 0) return Error.text("Metadata `" # Sleepy.AUTH_ICRC2_RATES # "` is not properly set");
+
+      let icrc2_rates = Option.get(Value.metaValueMapArray(metadata, Sleepy.AUTH_ICRC2_RATES), []);
+      // if (RBTree.size(icrc2_rates) == 0) return Error.text("Metadata `" # Sleepy.AUTH_ICRC2_RATES # "` is not properly set");
 
       let none_available_time = last_placed + none_rate_limit;
       let credit_available_time = user.credit_last_updated + credit_rate_limit;
-      let auto_errors = Buffer.Buffer<Sleepy.Auto_Failure>(5); // none, credit, eepy, icp, ckbtc
+      let auto_errors = Buffer.Buffer<Sleepy.Auto_Failure>(3 + icrc2_rates.size()); // none, credit, eepy, icp, ckbtc
 
-      let selected_auth = switch (arg.authorization) {
+      let self = Principal.fromActor(Self);
+      let passed_auth = switch (arg.authorization) {
         case (?#None) switch (Sleepy.authNoneCheck(now, none_available_time, last_placer)) {
-          case (#Err err) return #Err(err);
+          case (#Err err) return #Err(#Unauthorized err);
           case _ #None;
         };
         case (?#Credit) switch (Sleepy.authCreditCheck(user, now, credit_available_time)) {
-          case (#Err err) return #Err(err);
+          case (#Err err) return #Err(#Unauthorized err);
           case _ #Credit;
         };
-        case (?#ICRC2 payment) switch (Sleepy.);
+        case (?#ICRC2 payment) switch (Sleepy.authIcrc2Check(icrc2_rates, payment)) {
+          case (#Err(#ICRC2 err)) return #Err(#Unauthorized(#ICRC2 err));
+          case (#Err(#Text err)) return Error.text(err);
+          case _ #ICRC2 payment;
+        };
+        case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, last_placer, user, credit_available_time, icrc2_rates, user_account, self)) {
+          // case (#Ok(#ICRC2 selected_token)) {
+          //   user := getUser(caller);
+          //   subaccount := Sleepy.getSubaccount(user, arg_subaccount);
+          //   #ICRC2 selected_token;
+          // }; // commented because we will await balance/approval check later anyway
+          case (#Ok selected) selected;
+          case _ return #Err(#Unauthorized(#Automatic { failures = Buffer.toArray(auto_errors) }));
+        };
       };
 
       var tx_window = Nat64.fromNat(Value.getNat(metadata, Sleepy.TX_WINDOW, 0));
@@ -306,7 +321,6 @@ shared (install) persistent actor class Canister(
         ret;
       };
 
-      let self = Principal.fromActor(Self);
       let self_account = { owner = self; subaccount = null };
       let self_approval = { account = user_account; spender = self_account };
 
@@ -329,20 +343,21 @@ shared (install) persistent actor class Canister(
       if (buy_balance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyFunds { balance = buy_balance; minimum_balance = min_buy_balance_approval }));
       if (buy_approval.allowance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyAllowance { buy_approval with minimum_allowance = min_buy_balance_approval }));
 
-      switch (arg.authorization) {
-        case (?(#ICRC2 specified)) {
-
+      switch passed_auth {
+        case (#None) {
+          // update last_place(r/d)
         };
-        case (?#None or ?#Credit) (); // already checked
-        case (null) {
-          // automatic icrc2
+        case (#Credit) {
+          // consume user credit
+        };
+        case (#ICRC2 specified) {
+          // trasfer
         };
       };
 
       // user := getUser(caller);
       // subaccount := Sleepy.getSubaccount(user, arg_subaccount);
 
-      // todo: check auth
       // todo: trim users
       // todo: trim dedupes
       #Ok([]);
@@ -365,6 +380,7 @@ shared (install) persistent actor class Canister(
     case _ ({
       id = Sleepy.recycleId(user_ids);
       credit = 0;
+      credit_last_updated = 0;
       place_locked = null;
       subaccounts = RBTree.empty();
       subaccount_ids = RBTree.empty();

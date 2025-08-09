@@ -9,8 +9,13 @@ import Nat "mo:base/Nat";
 import Iter "mo:base/Iter";
 import Principal "mo:base/Principal";
 import Text "mo:base/Text";
-import Option "../util/motoko/Option";
+import Buffer "mo:base/Buffer";
+import Option "mo:base/Option";
+import OptionX "../util/motoko/Option";
 import Value "../util/motoko/Value";
+import Queue "../util/motoko/StableCollections/Queue";
+import Account "../util/motoko/ICRC-1/Account";
+import Management "../util/motoko/Management";
 
 module {
 
@@ -199,17 +204,17 @@ module {
     // todo: add caller
     // todo: add new fields from arg
     // todo: should created_at_time be first check for easier trim
-    var c = Option.compare(a.subaccount, b.subaccount, Blob.compare);
+    var c = OptionX.compare(a.subaccount, b.subaccount, Blob.compare);
     switch c {
       case (#equal) ();
       case _ return c;
     };
-    c := Option.compare(a.created_at_time, b.created_at_time, Nat64.compare);
+    c := OptionX.compare(a.created_at_time, b.created_at_time, Nat64.compare);
     switch c {
       case (#equal) ();
       case _ return c;
     };
-    c := Option.compare(a.memo, b.memo, Blob.compare);
+    c := OptionX.compare(a.memo, b.memo, Blob.compare);
     switch c {
       case (#equal) ();
       case _ return c;
@@ -303,29 +308,79 @@ module {
     // #Custom : Auto_Failure;
   };
 
-  public func authNoneCheck(now : Nat64, none_available_time : Nat64, last_placer : Principal) : Result.Type<(), { #Unauthorized : Unauthorized }> = if (now < none_available_time) return #Err(#Unauthorized(#None(#TemporarilyUnavailable { time = now; available_time = none_available_time; used_by = last_placer }))) else #Ok;
+  public func authNoneCheck(now : Nat64, none_available_time : Nat64, last_placer : Principal) : Result.Type<(), { #None : None_Failure }> = if (now < none_available_time) return #Err(#None(#TemporarilyUnavailable { time = now; available_time = none_available_time; used_by = last_placer })) else #Ok;
 
-  public func authCreditCheck(user : User, now : Nat64, credit_available_time : Nat64) : Result.Type<(), { #Unauthorized : Unauthorized }> {
-    if (user.credit == 0) return #Err(#Unauthorized(#Credit(#OutOfCredit)));
-
-    if (now < credit_available_time) return #Err(#Unauthorized(#Credit(#TemporarilyUnavailable { time = now; available_time = credit_available_time })));
+  public func authCreditCheck(user : User, now : Nat64, credit_available_time : Nat64) : Result.Type<(), { #Credit : Credit_Failure }> {
+    if (user.credit == 0) return #Err(#Credit(#OutOfCredit));
+    if (now < credit_available_time) return #Err(#Credit(#TemporarilyUnavailable { time = now; available_time = credit_available_time }));
     #Ok;
   };
 
-  public func authIcrc2Check(icrc2_rates : RBTree.Type<Principal, Value.Type>, auth : ICRC2_Auth) : Result.Type<(), { #Unauthorized : Unauthorized; #GenericError : Error.Type }> {
-    let rates = switch (RBTree.get(icrc2_rates, Principal.compare, auth.canister_id)) {
+  public func authIcrc2Check(icrc2_rates : [(Value.Type, Value.Type)], auth : ICRC2_Auth) : Result.Type<(), { #ICRC2 : ICRC2_Failure; #Text : Text }> {
+    if (icrc2_rates.size() == 0) return #Err(#ICRC2(#BadCanister { auth with expected_canister_ids = [] }));
+    let icrc2_rates_map = Value.mapArrayToPrincipalMap(icrc2_rates);
+    let rates = switch (RBTree.get(icrc2_rates_map, Principal.compare, auth.canister_id)) {
       case (?#Map found) RBTree.fromArray(found, Text.compare);
-      case _ return #Err(#Unauthorized(#ICRC2(#BadCanister { auth with expected_canister_ids = RBTree.arrayKey(icrc2_rates) })));
+      case _ return #Err(#ICRC2(#BadCanister { auth with expected_canister_ids = RBTree.arrayKey(icrc2_rates_map) }));
     };
     let expected_amount = Value.getNat(rates, "place", 0);
-    if (expected_amount == 0) return Error.text("Metadata `" # AUTH_ICRC2_RATES # "." # Principal.toText(auth.canister_id) # ".place` is not properly set");
+    if (expected_amount == 0) return #Err(#Text("Metadata `" # AUTH_ICRC2_RATES # "." # Principal.toText(auth.canister_id) # ".place` is not properly set"));
 
     switch (auth.amount) {
-      case (?amount) if (amount != expected_amount) return #Err(#Unauthorized(#ICRC2(#BadAmount { amount; expected_amount })));
+      case (?amount) if (amount != expected_amount) return #Err(#ICRC2(#BadAmount { amount; expected_amount }));
       case _ ();
     };
-
     #Ok;
   };
 
+  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credit_available_time : Nat64, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<Authorization, ()> {
+    switch (authNoneCheck(now, none_available_time, last_placer)) {
+      case (#Err(#None err)) failures.add(#None err);
+      case _ return #Ok(#None);
+    };
+    switch (authCreditCheck(user, now, credit_available_time)) {
+      case (#Err(#Credit err)) failures.add(#Credit err);
+      case _ return #Ok(#Credit);
+    };
+    if (icrc2_rates.size() == 0) {
+      failures.add(#ICRC2(#BadCanister { canister_id = Management.principal(); expected_canister_ids = [] }));
+      return #Err;
+    };
+    var q = Queue.empty<(token : Principal, amount : Nat, fee : async Nat, bal_res : async Nat, apr_res : async ICRC_1_Types.Allowance)>();
+    let self_account = { owner = self; subaccount = null };
+    let self_approval = { account = user_account; spender = self_account };
+    label rating for ((principalv, ratev) in icrc2_rates.vals()) {
+      let rate = switch ratev {
+        case (#Map map) RBTree.fromArray<Text, Value.Type>(map, Text.compare);
+        case _ continue rating;
+      };
+      let amt = Option.get(Value.metaNat(rate, "place"), 0);
+      if (amt == 0) continue rating;
+      let p = switch (Value.toPrincipal(principalv)) {
+        case (?found) found;
+        case _ continue rating;
+      };
+      let token = ICRC_1_Types.genActor(p);
+      let fee = token.icrc1_fee();
+      let balance = token.icrc1_balance_of(user_account);
+      let approval = token.icrc2_allowance(self_approval);
+      q := Queue.insertHead(q, (p, amt, fee, balance, approval));
+    };
+    if (Queue.size(q) == 0) {
+      failures.add(#ICRC2(#BadCanister { canister_id = Management.principal(); expected_canister_ids = [] }));
+      return #Err;
+    };
+    for ((p, amt, fee_res, bal_res, apr_res) in Queue.iterTail(q)) {
+      let fee = await fee_res;
+      let bal = await bal_res;
+      let apr = await apr_res;
+      let min = amt + fee;
+      if (bal < min) {
+        failures.add(#ICRC2(#TransferFromFailed(#InsufficientFunds { balance = bal })));
+      } else if (apr.allowance < min) {
+        failures.add(#ICRC2(#TransferFromFailed(#InsufficientAllowance apr)));
+      } else return #Ok(#ICRC2 { canister_id = p; amount = ?amt });
+    };
+    #Err;
+  };
 };
