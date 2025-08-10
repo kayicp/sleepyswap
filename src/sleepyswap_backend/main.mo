@@ -1,6 +1,5 @@
 import Principal "mo:base/Principal";
 import Nat "mo:base/Nat";
-import Blob "mo:base/Blob";
 import Nat8 "mo:base/Nat8";
 import Nat64 "mo:base/Nat64";
 import Buffer "mo:base/Buffer";
@@ -26,10 +25,9 @@ shared (install) persistent actor class Canister(
 
   var order_id = 0;
   var orders = RBTree.empty<Nat, Sleepy.Order>();
-  var closed_orders = RBTree.empty<Nat, ()>(); // to trim
-
-  var sell_book : Sleepy.Book = RBTree.empty();
-  var buy_book : Sleepy.Book = RBTree.empty();
+  var sell_book = RBTree.empty<Nat, Sleepy.Price>();
+  var buy_book = RBTree.empty<Nat, Sleepy.Price>();
+  var closed_orders = RBTree.empty<Nat, ()>(); // for trimming
 
   var trade_id = 0;
   var trades = RBTree.empty<Nat, Sleepy.Trade>();
@@ -37,8 +35,11 @@ shared (install) persistent actor class Canister(
   var user_ids = RBTree.empty<Nat, Principal>();
   var users = RBTree.empty<Principal, Sleepy.User>();
 
-  var last_placed = 0 : Nat64;
-  var last_placer = Management.principal();
+  var last_none_placed = 0 : Nat64;
+  var last_none_placer = Management.principal();
+
+  var sell_amount = Sleepy.newAmount(0);
+  var buy_amount = Sleepy.newAmount(0); // in buy unit
 
   var place_dedupes = RBTree.empty<Sleepy.PlaceArg, Sleepy.PlaceOk>();
 
@@ -251,13 +252,13 @@ shared (install) persistent actor class Canister(
 
       let icrc2_rates = Option.get(Value.metaValueMapArray(metadata, Sleepy.AUTH_ICRC2_RATES), []);
 
-      let none_available_time = last_placed + none_rate_limit;
+      let none_available_time = last_none_placed + none_rate_limit;
       let credit_available_time = user.credit_last_updated + credit_rate_limit;
       let auto_errors = Buffer.Buffer<Sleepy.Auto_Failure>(3 + icrc2_rates.size()); // none, credit, eepy, icp, ckbtc
 
       let self = Principal.fromActor(Self);
       let valid_auth = switch (arg.authorization) {
-        case (?#None) switch (Sleepy.authNoneCheck(now, none_available_time, last_placer)) {
+        case (?#None) switch (Sleepy.authNoneCheck(now, none_available_time, last_none_placer)) {
           case (#Err err) return #Err(#Unauthorized err);
           case _ #None;
         };
@@ -270,7 +271,7 @@ shared (install) persistent actor class Canister(
           case (#Err(#Text err)) return Error.text(err);
           case (#Ok payment) #ICRC2 payment;
         };
-        case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, last_placer, user, credit_available_time, icrc2_rates, user_account, self)) {
+        case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, last_none_placer, user, credit_available_time, icrc2_rates, user_account, self)) {
           case (#Ok selected) selected;
           case _ return #Err(#Unauthorized(#Automatic { failures = Buffer.toArray(auto_errors) }));
         };
@@ -325,14 +326,12 @@ shared (install) persistent actor class Canister(
       user := getUser(caller);
       subaccount := Sleepy.getSubaccount(user, arg_subaccount);
 
-      let sell_amount = subaccount.sell_amount;
-      let min_sell_balance_approval = (sell_amount.initial - sell_amount.filled) + total_incoming_sell_amount;
+      let min_sell_balance_approval = (subaccount.sell_amount.initial - subaccount.sell_amount.filled) + total_incoming_sell_amount;
 
       if (sell_balance < min_sell_balance_approval) return unlock(#Err(#InsufficientSellFunds { balance = sell_balance; minimum_balance = min_sell_balance_approval }));
       if (sell_approval.allowance < min_sell_balance_approval) return unlock(#Err(#InsufficientSellAllowance { sell_approval with minimum_allowance = min_sell_balance_approval }));
 
-      let buy_amount = subaccount.buy_amount;
-      let min_buy_balance_approval = (buy_amount.initial - buy_amount.filled) + total_incoming_buy_amount;
+      let min_buy_balance_approval = (subaccount.buy_amount.initial - subaccount.buy_amount.filled) + total_incoming_buy_amount;
 
       if (buy_balance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyFunds { balance = buy_balance; minimum_balance = min_buy_balance_approval }));
       if (buy_approval.allowance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyAllowance { buy_approval with minimum_allowance = min_buy_balance_approval }));
@@ -340,8 +339,8 @@ shared (install) persistent actor class Canister(
       // writing time
       let authorized = switch valid_auth {
         case (#None) {
-          last_placed := now;
-          last_placer := caller;
+          last_none_placed := now;
+          last_none_placer := caller;
           #None;
         };
         case (#Credit) {
@@ -371,12 +370,27 @@ shared (install) persistent actor class Canister(
           #ICRC2 { payment with xfer };
         };
       };
-
       for ((incoming_price, incoming_detail) in RBTree.entries(incoming_sells)) {
+        let new_oid = order_id;
+        let new_order = Sleepy.newOrder(now, user.id, subaccount.id, false, incoming_price, incoming_detail, authorized);
+        orders := RBTree.insert(orders, Nat.compare, new_oid, new_order);
+        order_id += 1;
 
+        subaccount := Sleepy.subaccountNewOrder(subaccount, new_oid, new_order);
+
+        var price = Sleepy.getPrice(sell_book, new_order.price);
+        price := Sleepy.priceNewOrder(price, new_oid, new_order);
+        sell_book := Sleepy.savePrice(sell_book, new_order, price);
       };
+      sell_amount := {
+        sell_amount with initial = sell_amount.initial + total_incoming_sell_amount
+      };
+
       for ((incoming_price, incoming_detail) in RBTree.entries(incoming_buys)) {
 
+      };
+      buy_amount := {
+        buy_amount with initial = buy_amount.initial + total_incoming_buy_amount
       };
 
       // todo: unlock user

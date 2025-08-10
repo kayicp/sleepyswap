@@ -53,10 +53,9 @@ module {
     subaccount : Nat; // user's subaccount id
     is_buy : Bool;
     price : Nat;
-    amount : Nat; // in sell unit
-    locked : Nat;
-    filled : Nat;
+    amount : Amount; // in sell unit
     trades : RBTree.Type<Nat, ()>; // trade ids
+    authorization : Authorized;
     closed : ?{
       at : Nat64;
       reason : {
@@ -73,19 +72,35 @@ module {
       };
     };
   };
-  public func newOrder(now : Nat64, user_id : Nat, subacc_id : Nat, is_buy : Bool, price : Nat, amount : Nat) : Order = {
+  public func newOrder(now : Nat64, user_id : Nat, subacc_id : Nat, is_buy : Bool, price : Nat, { amount : Nat }, auth : Authorized) : Order = {
     created_at = now;
     owner = user_id;
     subaccount = subacc_id;
+    authorization = auth;
     is_buy;
     price;
-    amount;
-    locked = 0;
-    filled = 0;
+    amount = newAmount(amount);
     trades = RBTree.empty();
     closed = null;
   };
-  public type Book = RBTree.Type<Nat, RBTree.Type<Nat, ()>>; // price to order ids
+  public type Price = {
+    amount : Amount;
+    orders : RBTree.Type<Nat, ()>;
+  };
+  public func getPrice(book : RBTree.Type<Nat, Price>, price : Nat) : Price = switch (RBTree.get(book, Nat.compare, price)) {
+    case (?found) found;
+    case _ ({
+      amount = newAmount(0);
+      orders = RBTree.empty();
+    });
+  };
+  public func priceNewOrder(p : Price, oid : Nat, o : Order) : Price = ({
+    amount = { p.amount with initial = p.amount.initial + o.amount.initial };
+    orders = RBTree.insert(p.orders, Nat.compare, oid, ());
+  });
+  public func savePrice(book : RBTree.Type<Nat, Price>, o : Order, p : Price) : RBTree.Type<Nat, Price> = if (p.amount.initial > 0) {
+    RBTree.insert(book, Nat.compare, o.price, p);
+  } else RBTree.delete(book, Nat.compare, o.price);
   type Call<OkT, ErrT> = {
     #Calling : { caller : Principal; timestamp : Nat64 };
     #Called : Result.Type<OkT, ErrT>;
@@ -102,7 +117,11 @@ module {
     };
   };
   type Amount = { initial : Nat; locked : Nat; filled : Nat };
-  func newAmount() : Amount = { initial = 0; locked = 0; filled = 0 };
+  public func newAmount(initial : Nat) : Amount = {
+    initial;
+    locked = 0;
+    filled = 0;
+  };
   type Subaccount = {
     id : Nat;
     orders : RBTree.Type<(id : Nat), ()>;
@@ -120,9 +139,9 @@ module {
       id = recycleId(user.subaccount_ids);
       orders = RBTree.empty();
       sells = RBTree.empty();
-      sell_amount = newAmount();
+      sell_amount = newAmount(0);
       buys = RBTree.empty();
-      buy_amount = newAmount();
+      buy_amount = newAmount(0);
       trades = RBTree.empty();
     });
   };
@@ -130,6 +149,22 @@ module {
     user with
     subaccounts = RBTree.insert(user.subaccounts, Blob.compare, subaccount_b, subaccount);
     subaccount_ids = RBTree.insert(user.subaccount_ids, Nat.compare, subaccount.id, subaccount_b);
+  };
+  public func subaccountNewOrder(_sa : Subaccount, oid : Nat, o : Order) : Subaccount {
+    let sa = if (o.is_buy) ({
+      _sa with buys = RBTree.insert(_sa.buys, Nat.compare, o.price, oid);
+      buy_amount = {
+        _sa.buy_amount with initial = _sa.buy_amount.initial + (o.amount.initial * o.price)
+      };
+    }) else ({
+      _sa with sells = RBTree.insert(_sa.sells, Nat.compare, o.price, oid);
+      sell_amount = {
+        _sa.sell_amount with initial = _sa.sell_amount.initial + o.amount.initial
+      };
+    });
+    {
+      sa with orders = RBTree.insert(sa.orders, Nat.compare, oid, ());
+    };
   };
   public type User = {
     id : Nat;
