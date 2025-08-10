@@ -32,20 +32,23 @@ module {
   public let MIN_SELL_AMOUNT = "sleepyswap:minimum_sell_amount";
   public let MIN_PRICE = "sleepyswap:minimum_price";
   public let TTL = "sleepyswap:time_to_live";
-  public let DEFAULT_EXPIRY = "sleepyswap:default_expiry";
-  public let MAX_EXPIRY = "sleepyswap:max_expiry";
-  public let MIN_EXPIRY = "sleepyswap:min_expiry";
-  public let AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT = "sleepyswap:auth_none_place_global_rate_limit"; // millisecond
-  public let AUTH_CREDIT_PLACE_RATE_LIMIT = "sleepyswap:auth_credit_place_rate_limit"; // millisecond
-  public let AUTH_ICRC2_RATES = "sleepyswap:auth_icrc2_rates"; // map(canisterid, map("place", amount))
+  public let DEFAULT_ORDER_EXPIRY = "sleepyswap:default_order_expiry";
+  public let MAX_ORDER_EXPIRY = "sleepyswap:max_order_expiry";
+  public let MIN_ORDER_EXPIRY = "sleepyswap:min_order_expiry";
+  public let AUTH_NONE_RATE_LIMIT = "sleepyswap:auth_none_rate_limit"; // millisecond
+  public let AUTH_NONE_CREDIT_REWARD = "sleepyswap:auth_none_credit_reward"; // 1
+  public let AUTH_CREDIT_RATE_LIMIT = "sleepyswap:auth_credit_rate_limit"; // millisecond
+  // todo: add when credit expiry
+  public let AUTH_ICRC2_RATES = "sleepyswap:auth_icrc2_fee_rates"; // map(canisterid, amount)
+  public let AUTH_ICRC2_CREDIT_REWARD = "sleepyswap:auth_icrc2_credit_reward"; // 2
 
   public let TX_WINDOW = "sleepyswap:tx_window";
   public let PERMITTED_DRIFT = "sleepyswap:permitted_drift";
 
-  // todo: memo size
+  // todo: add max memo size
 
   public type Order = {
-    created_at_time : Nat64;
+    created_at : Nat64;
     owner : Nat; // user id
     subaccount : Nat; // user's subaccount id
     is_buy : Bool;
@@ -54,20 +57,33 @@ module {
     locked : Nat;
     filled : Nat;
     trades : RBTree.Type<Nat, ()>; // trade ids
-    close : ?{
-      #Canceled : { timestamp : Nat64 };
-      #InsufficientFunds : {
-        balance : Nat;
-        minimum_balance : Nat;
-        timestamp : Nat64;
+    closed : ?{
+      at : Nat64;
+      reason : {
+        #Filled;
+        #Canceled;
+        #InsufficientFunds : {
+          balance : Nat;
+          minimum_balance : Nat;
+        };
+        #InsufficientAllowance : {
+          allowance : Nat;
+          minimum_allowance : Nat;
+        };
       };
-      #InsufficientAllowance : {
-        allowance : Nat;
-        minimum_allowance : Nat;
-        timestamp : Nat64;
-      };
-      #Filled : { timestamp : Nat64 };
     };
+  };
+  public func newOrder(now : Nat64, user_id : Nat, subacc_id : Nat, is_buy : Bool, price : Nat, amount : Nat) : Order = {
+    created_at = now;
+    owner = user_id;
+    subaccount = subacc_id;
+    is_buy;
+    price;
+    amount;
+    locked = 0;
+    filled = 0;
+    trades = RBTree.empty();
+    closed = null;
   };
   public type Book = RBTree.Type<Nat, RBTree.Type<Nat, ()>>; // price to order ids
   type Call<OkT, ErrT> = {
@@ -117,7 +133,7 @@ module {
   };
   public type User = {
     id : Nat;
-    credit : Nat; // todo: credit last updated
+    credit : Nat;
     credit_last_updated : Nat64;
     place_locked : ?Nat64;
     subaccounts : RBTree.Type<Blob, Subaccount>;
@@ -127,13 +143,13 @@ module {
 
   type OrderArg = { price : Nat; amount : Nat; expires_at : ?Nat64 };
   public type PlaceArg = {
-    // todo: payment, add to placeCompare
+    // todo: add auth to placeCompare
     subaccount : ?Blob;
-    created_at_time : ?Nat64;
     memo : ?Blob; // todo: check memo
-    authorization : ?Authorization; // if not set, it's auto
     buy_orders : [OrderArg];
     sell_orders : [OrderArg];
+    authorization : ?Authorization;
+    created_at_time : ?Nat64;
   };
   public type PlaceOk = [Nat];
   public type PlaceError = {
@@ -316,24 +332,38 @@ module {
     #Ok;
   };
 
-  public func authIcrc2Check(icrc2_rates : [(Value.Type, Value.Type)], auth : ICRC2_Auth) : Result.Type<(), { #ICRC2 : ICRC2_Failure; #Text : Text }> {
+  type ICRC2_Selected = { canister_id : Principal; amount : Nat; fee : Nat };
+  public func authIcrc2Check(icrc2_rates : [(Value.Type, Value.Type)], auth : ICRC2_Auth, user_account : Account.Pair, self : Principal) : async* Result.Type<ICRC2_Selected, { #ICRC2 : ICRC2_Failure; #Text : Text }> {
     if (icrc2_rates.size() == 0) return #Err(#ICRC2(#BadCanister { auth with expected_canister_ids = [] }));
     let icrc2_rates_map = Value.mapArrayToPrincipalMap(icrc2_rates);
-    let rates = switch (RBTree.get(icrc2_rates_map, Principal.compare, auth.canister_id)) {
-      case (?#Map found) RBTree.fromArray(found, Text.compare);
+    let expected_amount = switch (RBTree.get(icrc2_rates_map, Principal.compare, auth.canister_id)) {
+      case (?#Nat found) found;
       case _ return #Err(#ICRC2(#BadCanister { auth with expected_canister_ids = RBTree.arrayKey(icrc2_rates_map) }));
     };
-    let expected_amount = Value.getNat(rates, "place", 0);
     if (expected_amount == 0) return #Err(#Text("Metadata `" # AUTH_ICRC2_RATES # "." # Principal.toText(auth.canister_id) # ".place` is not properly set"));
 
     switch (auth.amount) {
       case (?amount) if (amount != expected_amount) return #Err(#ICRC2(#BadAmount { amount; expected_amount }));
       case _ ();
     };
-    #Ok;
+    let self_account = { owner = self; subaccount = null };
+    let self_approval = { account = user_account; spender = self_account };
+    let token = ICRC_1_Types.genActor(auth.canister_id);
+    let fee_res = token.icrc1_fee();
+    let bal_res = token.icrc1_balance_of(user_account);
+    let apr_res = token.icrc2_allowance(self_approval);
+    let fee = await fee_res;
+    let bal = await bal_res;
+    let apr = await apr_res;
+    let min = expected_amount + fee;
+    if (bal < min) {
+      #Err(#ICRC2(#TransferFromFailed(#InsufficientFunds { balance = bal })));
+    } else if (apr.allowance < min) {
+      #Err(#ICRC2(#TransferFromFailed(#InsufficientAllowance apr)));
+    } else #Ok { auth with amount = expected_amount; fee };
   };
 
-  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credit_available_time : Nat64, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<Authorization, ()> {
+  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credit_available_time : Nat64, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<{ #None; #Credit; #ICRC2 : ICRC2_Selected }, ()> {
     switch (authNoneCheck(now, none_available_time, last_placer)) {
       case (#Err(#None err)) failures.add(#None err);
       case _ return #Ok(#None);
@@ -349,12 +379,11 @@ module {
     var q = Queue.empty<(token : Principal, amount : Nat, fee : async Nat, bal_res : async Nat, apr_res : async ICRC_1_Types.Allowance)>();
     let self_account = { owner = self; subaccount = null };
     let self_approval = { account = user_account; spender = self_account };
-    label rating for ((principalv, ratev) in icrc2_rates.vals()) {
-      let rate = switch ratev {
-        case (#Map map) RBTree.fromArray<Text, Value.Type>(map, Text.compare);
+    label rating for ((principalv, amtv) in icrc2_rates.vals()) {
+      let amt = switch amtv {
+        case (#Nat n) n;
         case _ continue rating;
       };
-      let amt = Option.get(Value.metaNat(rate, "place"), 0);
       if (amt == 0) continue rating;
       let p = switch (Value.toPrincipal(principalv)) {
         case (?found) found;
@@ -379,7 +408,7 @@ module {
         failures.add(#ICRC2(#TransferFromFailed(#InsufficientFunds { balance = bal })));
       } else if (apr.allowance < min) {
         failures.add(#ICRC2(#TransferFromFailed(#InsufficientAllowance apr)));
-      } else return #Ok(#ICRC2 { canister_id = p; amount = ?amt });
+      } else return #Ok(#ICRC2 { canister_id = p; amount = amt; fee });
     };
     #Err;
   };

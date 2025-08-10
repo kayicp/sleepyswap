@@ -122,32 +122,32 @@ shared (install) persistent actor class Canister(
         metadata := Value.setNat(metadata, Sleepy.MIN_PRICE, ?min_price);
       };
 
-      var max_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.MAX_EXPIRY, 0)));
+      var max_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.MAX_ORDER_EXPIRY, 0)));
       let lowest_max_expiry = Time64.HOURS(24);
       let highest_max_expiry = lowest_max_expiry * 30;
       if (max_expiry < lowest_max_expiry) {
         max_expiry := lowest_max_expiry;
-        metadata := Value.setNat(metadata, Sleepy.MAX_EXPIRY, ?(Nat64.toNat(lowest_max_expiry / 1_000_000_000)));
+        metadata := Value.setNat(metadata, Sleepy.MAX_ORDER_EXPIRY, ?(Nat64.toNat(lowest_max_expiry / 1_000_000_000)));
       } else if (max_expiry > highest_max_expiry) {
         max_expiry := highest_max_expiry;
-        metadata := Value.setNat(metadata, Sleepy.MAX_EXPIRY, ?(Nat64.toNat(highest_max_expiry / 1_000_000_000)));
+        metadata := Value.setNat(metadata, Sleepy.MAX_ORDER_EXPIRY, ?(Nat64.toNat(highest_max_expiry / 1_000_000_000)));
       };
 
-      var min_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.MIN_EXPIRY, 0)));
+      var min_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.MIN_ORDER_EXPIRY, 0)));
       let lowest_min_expiry = Time64.HOURS(1);
       let max_expiry_seconds = Nat64.toNat(max_expiry / 1_000_000_000);
       if (min_expiry < lowest_min_expiry) {
         min_expiry := lowest_min_expiry;
-        metadata := Value.setNat(metadata, Sleepy.MIN_EXPIRY, ?(Nat64.toNat(min_expiry / 1_000_000_000)));
+        metadata := Value.setNat(metadata, Sleepy.MIN_ORDER_EXPIRY, ?(Nat64.toNat(min_expiry / 1_000_000_000)));
       } else if (min_expiry > max_expiry) {
         min_expiry := max_expiry;
-        metadata := Value.setNat(metadata, Sleepy.DEFAULT_EXPIRY, ?max_expiry_seconds);
+        metadata := Value.setNat(metadata, Sleepy.DEFAULT_ORDER_EXPIRY, ?max_expiry_seconds);
       };
 
-      var default_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.DEFAULT_EXPIRY, 0)));
+      var default_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.DEFAULT_ORDER_EXPIRY, 0)));
       if (default_expiry < min_expiry or default_expiry > max_expiry) {
         default_expiry := (min_expiry + max_expiry) / 2;
-        metadata := Value.setNat(metadata, Sleepy.DEFAULT_EXPIRY, ?(Nat64.toNat(default_expiry / 1_000_000_000)));
+        metadata := Value.setNat(metadata, Sleepy.DEFAULT_ORDER_EXPIRY, ?(Nat64.toNat(default_expiry / 1_000_000_000)));
       };
 
       let now = Time64.nanos();
@@ -238,26 +238,25 @@ shared (install) persistent actor class Canister(
       };
 
       let min_rate_limit = Time64.MILLI(10);
-      var none_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT, 0)));
+      var none_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, 0)));
       if (none_rate_limit < min_rate_limit) {
         none_rate_limit := min_rate_limit;
-        metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_PLACE_GLOBAL_RATE_LIMIT, ?10);
+        metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, ?10);
       };
-      var credit_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_CREDIT_PLACE_RATE_LIMIT, 0)));
+      var credit_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_CREDIT_RATE_LIMIT, 0)));
       if (credit_rate_limit < min_rate_limit) {
         credit_rate_limit := min_rate_limit;
-        metadata := Value.setNat(metadata, Sleepy.AUTH_CREDIT_PLACE_RATE_LIMIT, ?10);
+        metadata := Value.setNat(metadata, Sleepy.AUTH_CREDIT_RATE_LIMIT, ?10);
       };
 
       let icrc2_rates = Option.get(Value.metaValueMapArray(metadata, Sleepy.AUTH_ICRC2_RATES), []);
-      // if (RBTree.size(icrc2_rates) == 0) return Error.text("Metadata `" # Sleepy.AUTH_ICRC2_RATES # "` is not properly set");
 
       let none_available_time = last_placed + none_rate_limit;
       let credit_available_time = user.credit_last_updated + credit_rate_limit;
       let auto_errors = Buffer.Buffer<Sleepy.Auto_Failure>(3 + icrc2_rates.size()); // none, credit, eepy, icp, ckbtc
 
       let self = Principal.fromActor(Self);
-      let passed_auth = switch (arg.authorization) {
+      let valid_auth = switch (arg.authorization) {
         case (?#None) switch (Sleepy.authNoneCheck(now, none_available_time, last_placer)) {
           case (#Err err) return #Err(#Unauthorized err);
           case _ #None;
@@ -266,36 +265,31 @@ shared (install) persistent actor class Canister(
           case (#Err err) return #Err(#Unauthorized err);
           case _ #Credit;
         };
-        case (?#ICRC2 payment) switch (Sleepy.authIcrc2Check(icrc2_rates, payment)) {
+        case (?#ICRC2 auth) switch (await* Sleepy.authIcrc2Check(icrc2_rates, auth, user_account, self)) {
           case (#Err(#ICRC2 err)) return #Err(#Unauthorized(#ICRC2 err));
           case (#Err(#Text err)) return Error.text(err);
-          case _ #ICRC2 payment;
+          case (#Ok payment) #ICRC2 payment;
         };
         case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, last_placer, user, credit_available_time, icrc2_rates, user_account, self)) {
-          // case (#Ok(#ICRC2 selected_token)) {
-          //   user := getUser(caller);
-          //   subaccount := Sleepy.getSubaccount(user, arg_subaccount);
-          //   #ICRC2 selected_token;
-          // }; // commented because we will await balance/approval check later anyway
           case (#Ok selected) selected;
           case _ return #Err(#Unauthorized(#Automatic { failures = Buffer.toArray(auto_errors) }));
         };
+        // note: we dont refresh user+subaccount because we're gonna do it later after the next await
       };
 
+      // all arg has been validated, now to dedupe it
       var tx_window = Nat64.fromNat(Value.getNat(metadata, Sleepy.TX_WINDOW, 0));
       let min_tx_window = Time64.MINUTES(15);
       if (tx_window < min_tx_window) {
         tx_window := min_tx_window;
         metadata := Value.setNat(metadata, Sleepy.TX_WINDOW, ?(Nat64.toNat(tx_window)));
       };
-
       var permitted_drift = Nat64.fromNat(Value.getNat(metadata, Sleepy.PERMITTED_DRIFT, 0));
       let min_permitted_drift = Time64.SECONDS(5);
       if (permitted_drift < min_permitted_drift) {
         permitted_drift := min_permitted_drift;
         metadata := Value.setNat(metadata, Sleepy.PERMITTED_DRIFT, ?(Nat64.toNat(permitted_drift)));
       };
-
       switch (arg.created_at_time) {
         case (?created_time) {
           let start_time = now - tx_window - permitted_drift;
@@ -343,21 +337,49 @@ shared (install) persistent actor class Canister(
       if (buy_balance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyFunds { balance = buy_balance; minimum_balance = min_buy_balance_approval }));
       if (buy_approval.allowance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyAllowance { buy_approval with minimum_allowance = min_buy_balance_approval }));
 
-      switch passed_auth {
+      // writing time
+      let authorized = switch valid_auth {
         case (#None) {
-          // update last_place(r/d)
+          last_placed := now;
+          last_placer := caller;
+          #None;
         };
         case (#Credit) {
-          // consume user credit
+          user := {
+            user with credit = user.credit - 1;
+            credit_last_updated = now;
+          };
+          #Credit;
         };
-        case (#ICRC2 specified) {
-          // trasfer
+        case (#ICRC2 payment) {
+          let token = ICRC_1_Types.genActor(payment.canister_id);
+          let xfer_arg = {
+            to = self_account;
+            fee = ?payment.fee;
+            spender_subaccount = self_account.subaccount;
+            from = user_account;
+            memo = null;
+            created_at_time = null;
+            amount = payment.amount;
+          };
+          let xfer = switch (await token.icrc2_transfer_from(xfer_arg)) {
+            case (#Err err) return #Err(#Unauthorized(#ICRC2(#TransferFromFailed err)));
+            case (#Ok block_id) block_id;
+          };
+          user := getUser(caller);
+          subaccount := Sleepy.getSubaccount(user, arg_subaccount);
+          #ICRC2 { payment with xfer };
         };
       };
 
-      // user := getUser(caller);
-      // subaccount := Sleepy.getSubaccount(user, arg_subaccount);
+      for ((incoming_price, incoming_detail) in RBTree.entries(incoming_sells)) {
 
+      };
+      for ((incoming_price, incoming_detail) in RBTree.entries(incoming_buys)) {
+
+      };
+
+      // todo: unlock user
       // todo: trim users
       // todo: trim dedupes
       #Ok([]);
