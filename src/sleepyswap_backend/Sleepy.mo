@@ -37,8 +37,9 @@ module {
   public let MIN_ORDER_EXPIRY = "sleepyswap:min_order_expiry";
   public let AUTH_NONE_RATE_LIMIT = "sleepyswap:auth_none_rate_limit"; // millisecond
   public let AUTH_NONE_CREDIT_REWARD = "sleepyswap:auth_none_credit_reward"; // 1
-  public let AUTH_CREDIT_RATE_LIMIT = "sleepyswap:auth_credit_rate_limit"; // millisecond
   // todo: add when credit expiry
+  // public let AUTH_CREDIT_PLACE_EXPIRY = "sleepyswap:auth_credit_place_expiry";
+  // public let AUTH_CREDIT_MATCH_EXPIRY = "sleepyswap:auth_credit_match_expiry";
   public let AUTH_ICRC2_RATES = "sleepyswap:auth_icrc2_fee_rates"; // map(canisterid, amount)
   public let AUTH_ICRC2_CREDIT_REWARD = "sleepyswap:auth_icrc2_credit_reward"; // 2
 
@@ -54,12 +55,14 @@ module {
     is_buy : Bool;
     price : Nat;
     amount : Amount; // in sell unit
+    expires_at : Nat64;
     trades : RBTree.Type<Nat, ()>; // trade ids
     authorization : Authorized;
     closed : ?{
       at : Nat64;
       reason : {
         #Filled;
+        #Expired;
         #Canceled;
         #InsufficientFunds : {
           balance : Nat;
@@ -72,7 +75,7 @@ module {
       };
     };
   };
-  public func newOrder(now : Nat64, user_id : Nat, subacc_id : Nat, is_buy : Bool, price : Nat, { amount : Nat }, auth : Authorized) : Order = {
+  public func newOrder(now : Nat64, user_id : Nat, subacc_id : Nat, is_buy : Bool, price : Nat, { amount : Nat; expires_at : Nat64 }, auth : Authorized) : Order = {
     created_at = now;
     owner = user_id;
     subaccount = subacc_id;
@@ -80,6 +83,7 @@ module {
     is_buy;
     price;
     amount = newAmount(amount);
+    expires_at;
     trades = RBTree.empty();
     closed = null;
   };
@@ -166,13 +170,25 @@ module {
       sa with orders = RBTree.insert(sa.orders, Nat.compare, oid, ());
     };
   };
+  public type Credit = {
+    // todo: redesign credit system?
+    owner : Nat; // user id
+    credited_at : Nat64;
+    amount : Nat;
+    used : RBTree.Type<(index : Nat), { start : Nat; length : Nat }>;
+    reason : {
+      #Place : { start : Nat; length : Nat }; // order ids
+      /* #Match : { trade_id : Nat }; */
+      /* #Topup : { xfer : Nat } */
+    };
+  };
   public type User = {
     id : Nat;
-    credit : Nat;
-    credit_last_updated : Nat64;
     place_locked : ?Nat64;
     subaccounts : RBTree.Type<Blob, Subaccount>;
     subaccount_ids : RBTree.Type<Nat, Blob>;
+    credits_remaining : Nat;
+    credits_by_expiry : RBTree.Type<(expires_at : Nat64), (credit_id : Nat)>; // todo: cant do this, credits might share same expiry... redesign anything that has expiry, even if it's consuming more storage
   };
   public type Users = RBTree.Type<Principal, User>;
 
@@ -315,17 +331,18 @@ module {
     if (n - lower <= upper - n) lower else upper;
   };
 
-  type ICRC2_Auth = { canister_id : Principal; amount : ?Nat };
+  type ICRC2_Authorization = { canister_id : Principal; amount : ?Nat };
   public type Authorization = {
     #None;
     #Credit;
-    #ICRC2 : ICRC2_Auth;
-    // #Custom : { options : [{ #None; #Credit; #ICRC2 : ICRC2_Auth }] };
+    #ICRC2 : ICRC2_Authorization;
+    // #Custom : { options : [{ #None; #Credit; #ICRC2 : ICRC2_Authorization }] };
   };
+  public type ICRC2_Authorized = { canister_id : Principal; xfer : Nat };
   public type Authorized = {
     #None;
-    #Credit;
-    #ICRC2 : { canister_id : Principal; xfer : Nat };
+    #Credit : { id : Nat; used_index : Nat };
+    #ICRC2 : ICRC2_Authorized;
   };
   type None_Failure = {
     #TemporarilyUnavailable : {
@@ -335,7 +352,6 @@ module {
     };
   };
   type Credit_Failure = {
-    #TemporarilyUnavailable : { time : Nat64; available_time : Nat64 };
     #OutOfCredit;
   };
   type ICRC2_Failure = {
@@ -361,14 +377,20 @@ module {
 
   public func authNoneCheck(now : Nat64, none_available_time : Nat64, last_placer : Principal) : Result.Type<(), { #None : None_Failure }> = if (now < none_available_time) return #Err(#None(#TemporarilyUnavailable { time = now; available_time = none_available_time; used_by = last_placer })) else #Ok;
 
-  public func authCreditCheck(user : User, now : Nat64, credit_available_time : Nat64) : Result.Type<(), { #Credit : Credit_Failure }> {
-    if (user.credit == 0) return #Err(#Credit(#OutOfCredit));
-    if (now < credit_available_time) return #Err(#Credit(#TemporarilyUnavailable { time = now; available_time = credit_available_time }));
-    #Ok;
+  public func authCreditCheck(user : User, now : Nat64, credits : RBTree.Type<Nat, Credit>) : Result.Type<(Nat, Credit), { #Credit : Credit_Failure }> {
+    label checking for ((expires_at, credit_id) in RBTree.entries(user.credits_by_expiry)) {
+      if (now > expires_at) continue checking;
+      let credit = switch (RBTree.get(credits, Nat.compare, credit_id)) {
+        case (?found) found;
+        case _ continue checking;
+      };
+      if (credit.amount > RBTree.size(credit.used)) return #Ok(credit_id, credit);
+    };
+    #Err(#Credit(#OutOfCredit));
   };
 
   type ICRC2_Selected = { canister_id : Principal; amount : Nat; fee : Nat };
-  public func authIcrc2Check(icrc2_rates : [(Value.Type, Value.Type)], auth : ICRC2_Auth, user_account : Account.Pair, self : Principal) : async* Result.Type<ICRC2_Selected, { #ICRC2 : ICRC2_Failure; #Text : Text }> {
+  public func authIcrc2Check(icrc2_rates : [(Value.Type, Value.Type)], auth : ICRC2_Authorization, user_account : Account.Pair, self : Principal) : async* Result.Type<ICRC2_Selected, { #ICRC2 : ICRC2_Failure; #Text : Text }> {
     if (icrc2_rates.size() == 0) return #Err(#ICRC2(#BadCanister { auth with expected_canister_ids = [] }));
     let icrc2_rates_map = Value.mapArrayToPrincipalMap(icrc2_rates);
     let expected_amount = switch (RBTree.get(icrc2_rates_map, Principal.compare, auth.canister_id)) {
@@ -398,14 +420,14 @@ module {
     } else #Ok { auth with amount = expected_amount; fee };
   };
 
-  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credit_available_time : Nat64, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<{ #None; #Credit; #ICRC2 : ICRC2_Selected }, ()> {
+  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credits : RBTree.Type<Nat, Credit>, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<{ #None; #Credit : (Nat, Credit); #ICRC2 : ICRC2_Selected }, ()> {
     switch (authNoneCheck(now, none_available_time, last_placer)) {
       case (#Err(#None err)) failures.add(#None err);
       case _ return #Ok(#None);
     };
-    switch (authCreditCheck(user, now, credit_available_time)) {
+    switch (authCreditCheck(user, now, credits)) {
       case (#Err(#Credit err)) failures.add(#Credit err);
-      case _ return #Ok(#Credit);
+      case (#Ok found) return #Ok(#Credit found);
     };
     if (icrc2_rates.size() == 0) {
       failures.add(#ICRC2(#BadCanister { canister_id = Management.principal(); expected_canister_ids = [] }));

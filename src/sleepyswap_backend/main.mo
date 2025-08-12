@@ -25,9 +25,11 @@ shared (install) persistent actor class Canister(
 
   var order_id = 0;
   var orders = RBTree.empty<Nat, Sleepy.Order>();
+
   var sell_book = RBTree.empty<Nat, Sleepy.Price>();
   var buy_book = RBTree.empty<Nat, Sleepy.Price>();
-  var closed_orders = RBTree.empty<Nat, ()>(); // for trimming
+  var sell_amount = Sleepy.newAmount(0);
+  var buy_amount = Sleepy.newAmount(0); // in buy unit
 
   var trade_id = 0;
   var trades = RBTree.empty<Nat, Sleepy.Trade>();
@@ -38,8 +40,8 @@ shared (install) persistent actor class Canister(
   var last_none_placed = 0 : Nat64;
   var last_none_placer = Management.principal();
 
-  var sell_amount = Sleepy.newAmount(0);
-  var buy_amount = Sleepy.newAmount(0); // in buy unit
+  var credit_id = 0;
+  var credits = RBTree.empty<Nat, Sleepy.Credit>();
 
   var place_dedupes = RBTree.empty<Sleepy.PlaceArg, Sleepy.PlaceOk>();
 
@@ -156,7 +158,7 @@ shared (install) persistent actor class Canister(
       let min_expires_at = now + min_expiry;
       let default_expires_at = now + default_expiry;
       var total_incoming_sell_amount = 0;
-      var incoming_sells = RBTree.empty<(price : Nat), { index : Nat; amount : Nat }>();
+      var incoming_sells = RBTree.empty<(price : Nat), { index : Nat; amount : Nat; expires_at : Nat64 }>();
       for (incoming in arg.sell_orders.vals()) {
         let incoming_index = RBTree.size(incoming_sells);
 
@@ -181,13 +183,18 @@ shared (install) persistent actor class Canister(
         if (incoming.amount != nearest_amount) return #Err(#SellAmountTooFar { incoming with index = incoming_index; nearest_amount });
 
         total_incoming_sell_amount += incoming.amount;
-        incoming_sells := RBTree.insert(incoming_sells, Nat.compare, incoming.price, { incoming with index = incoming_index });
+        incoming_sells := RBTree.insert(incoming_sells, Nat.compare, incoming.price, { incoming with index = incoming_index; expires_at = incoming_expires_at });
       };
 
       var total_incoming_buy_amount = 0;
-      var incoming_buys = RBTree.empty<(price : Nat), { index : Nat; amount : Nat }>();
+      var incoming_buys = RBTree.empty<(price : Nat), { index : Nat; amount : Nat; expires_at : Nat64 }>();
       for (incoming in arg.buy_orders.vals()) {
         let incoming_index = RBTree.size(incoming_buys);
+
+        let incoming_expires_at = Option.get(incoming.expires_at, default_expires_at);
+        if (incoming_expires_at < min_expires_at) return #Err(#ExpiresTooSoon { expires_at = incoming_expires_at; index = incoming_index; minimum_expires_at = min_expires_at });
+        if (incoming_expires_at > max_expires_at) return #Err(#ExpiresTooLate { expires_at = incoming_expires_at; index = incoming_index; maximum_expires_at = max_expires_at });
+
         if (incoming.price < min_price) return #Err(#BuyPriceTooLow { incoming with index = incoming_index; minimum_price = min_price });
 
         let nearest_price = Sleepy.nearTick(incoming.price, price_tick);
@@ -205,7 +212,7 @@ shared (install) persistent actor class Canister(
         if (incoming.amount != nearest_amount) return #Err(#BuyAmountTooFar { incoming with index = incoming_index; nearest_amount });
 
         total_incoming_buy_amount += incoming.amount * incoming.price;
-        incoming_buys := RBTree.insert(incoming_buys, Nat.compare, incoming.price, { incoming with index = incoming_index });
+        incoming_buys := RBTree.insert(incoming_buys, Nat.compare, incoming.price, { incoming with index = incoming_index; expires_at = incoming_expires_at });
       };
       let min_incoming_sell = RBTree.min(incoming_sells);
       let max_incoming_buy = RBTree.max(incoming_buys);
@@ -238,22 +245,16 @@ shared (install) persistent actor class Canister(
         case _ ();
       };
 
-      let min_rate_limit = Time64.MILLI(10);
-      var none_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, 0)));
+      let min_rate_limit = Time64.SECONDS(1);
+      var none_rate_limit = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, 0)));
       if (none_rate_limit < min_rate_limit) {
         none_rate_limit := min_rate_limit;
-        metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, ?10);
-      };
-      var credit_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_CREDIT_RATE_LIMIT, 0)));
-      if (credit_rate_limit < min_rate_limit) {
-        credit_rate_limit := min_rate_limit;
-        metadata := Value.setNat(metadata, Sleepy.AUTH_CREDIT_RATE_LIMIT, ?10);
+        metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, ?1);
       };
 
       let icrc2_rates = Option.get(Value.metaValueMapArray(metadata, Sleepy.AUTH_ICRC2_RATES), []);
 
       let none_available_time = last_none_placed + none_rate_limit;
-      let credit_available_time = user.credit_last_updated + credit_rate_limit;
       let auto_errors = Buffer.Buffer<Sleepy.Auto_Failure>(3 + icrc2_rates.size()); // none, credit, eepy, icp, ckbtc
 
       let self = Principal.fromActor(Self);
@@ -262,16 +263,16 @@ shared (install) persistent actor class Canister(
           case (#Err err) return #Err(#Unauthorized err);
           case _ #None;
         };
-        case (?#Credit) switch (Sleepy.authCreditCheck(user, now, credit_available_time)) {
+        case (?#Credit) switch (Sleepy.authCreditCheck(user, now, credits)) {
           case (#Err err) return #Err(#Unauthorized err);
-          case _ #Credit;
+          case (#Ok found) #Credit found;
         };
         case (?#ICRC2 auth) switch (await* Sleepy.authIcrc2Check(icrc2_rates, auth, user_account, self)) {
           case (#Err(#ICRC2 err)) return #Err(#Unauthorized(#ICRC2 err));
           case (#Err(#Text err)) return Error.text(err);
           case (#Ok payment) #ICRC2 payment;
         };
-        case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, last_none_placer, user, credit_available_time, icrc2_rates, user_account, self)) {
+        case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, last_none_placer, user, credits, icrc2_rates, user_account, self)) {
           case (#Ok selected) selected;
           case _ return #Err(#Unauthorized(#Automatic { failures = Buffer.toArray(auto_errors) }));
         };
@@ -337,18 +338,23 @@ shared (install) persistent actor class Canister(
       if (buy_approval.allowance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyAllowance { buy_approval with minimum_allowance = min_buy_balance_approval }));
 
       // writing time
+
       let authorized = switch valid_auth {
         case (#None) {
-          last_none_placed := now;
+          last_none_placed := now; // todo: reference order id instead of caller?
           last_none_placer := caller;
           #None;
         };
-        case (#Credit) {
-          user := {
-            user with credit = user.credit - 1;
-            credit_last_updated = now;
+        case (#Credit(credit_id, credit)) {
+          let index = RBTree.size(credit.used);
+          let used = {
+            credit with used = RBTree.insert(credit.used, Nat.compare, index, { start = order_id; length = RBTree.size(incoming_sells) + RBTree.size(incoming_buys) })
           };
-          #Credit;
+          credits := RBTree.insert(credits, Nat.compare, credit_id, used);
+          user := {
+            user with credits_remaining = user.credits_remaining - 1;
+          };
+          #Credit({ id = credit_id; used_index = index });
         };
         case (#ICRC2 payment) {
           let token = ICRC_1_Types.genActor(payment.canister_id);
@@ -387,13 +393,23 @@ shared (install) persistent actor class Canister(
       };
 
       for ((incoming_price, incoming_detail) in RBTree.entries(incoming_buys)) {
+        let new_oid = order_id;
+        let new_order = Sleepy.newOrder(now, user.id, subaccount.id, true, incoming_price, incoming_detail, authorized);
+        orders := RBTree.insert(orders, Nat.compare, new_oid, new_order);
+        order_id += 1;
 
+        subaccount := Sleepy.subaccountNewOrder(subaccount, new_oid, new_order);
+
+        var price = Sleepy.getPrice(buy_book, new_order.price);
+        price := Sleepy.priceNewOrder(price, new_oid, new_order);
+        buy_book := Sleepy.savePrice(buy_book, new_order, price);
       };
       buy_amount := {
         buy_amount with initial = buy_amount.initial + total_incoming_buy_amount
       };
+      user := Sleepy.saveSubaccount(user, arg_subaccount, subaccount);
+      unlock();
 
-      // todo: unlock user
       // todo: trim users
       // todo: trim dedupes
       #Ok([]);
@@ -415,11 +431,11 @@ shared (install) persistent actor class Canister(
     case (?found) found;
     case _ ({
       id = Sleepy.recycleId(user_ids);
-      credit = 0;
-      credit_last_updated = 0;
       place_locked = null;
       subaccounts = RBTree.empty();
       subaccount_ids = RBTree.empty();
+      credits_remaining = 0;
+      credits_by_expiry = RBTree.empty();
     });
   };
   func saveUser(p : Principal, user : Sleepy.User) : Sleepy.User {
