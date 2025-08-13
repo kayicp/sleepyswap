@@ -25,9 +25,11 @@ shared (install) persistent actor class Canister(
 
   var order_id = 0;
   var orders = RBTree.empty<Nat, Sleepy.Order>();
+  var orders_by_expiry = RBTree.empty<Nat64, RBTree.Type<Nat, ()>>();
 
   var sell_book = RBTree.empty<Nat, Sleepy.Price>();
   var buy_book = RBTree.empty<Nat, Sleepy.Price>();
+
   var sell_amount = Sleepy.newAmount(0);
   var buy_amount = Sleepy.newAmount(0); // in buy unit
 
@@ -40,10 +42,17 @@ shared (install) persistent actor class Canister(
   var last_none_placed = 0 : Nat64;
   var last_none_placer = Management.principal();
 
-  var credit_id = 0;
   var credits = RBTree.empty<Nat, Sleepy.Credit>();
+  var credits_by_expiry = RBTree.empty<Nat64, RBTree.Type<Nat, ()>>();
 
   var place_dedupes = RBTree.empty<Sleepy.PlaceArg, Sleepy.PlaceOk>();
+
+  var block_id = 0;
+  var blocks = RBTree.empty<Nat, Value.Type>();
+
+  func trim() {
+    // trim all stable vars (orders, trades, users, credits, dedupes, blocks)
+  };
 
   var metadata : Value.Metadata = RBTree.empty();
 
@@ -265,7 +274,7 @@ shared (install) persistent actor class Canister(
         };
         case (?#Credit) switch (Sleepy.authCreditCheck(user, now, credits)) {
           case (#Err err) return #Err(#Unauthorized err);
-          case (#Ok found) #Credit found;
+          case _ #Credit;
         };
         case (?#ICRC2 auth) switch (await* Sleepy.authIcrc2Check(icrc2_rates, auth, user_account, self)) {
           case (#Err(#ICRC2 err)) return #Err(#Unauthorized(#ICRC2 err));
@@ -337,24 +346,22 @@ shared (install) persistent actor class Canister(
       if (buy_balance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyFunds { balance = buy_balance; minimum_balance = min_buy_balance_approval }));
       if (buy_approval.allowance < min_buy_balance_approval) return unlock(#Err(#InsufficientBuyAllowance { buy_approval with minimum_allowance = min_buy_balance_approval }));
 
-      // writing time
-
+      // write mode
       let authorized = switch valid_auth {
         case (#None) {
-          last_none_placed := now; // todo: reference order id instead of caller?
+          last_none_placed := now;
           last_none_placer := caller;
           #None;
         };
-        case (#Credit(credit_id, credit)) {
-          let index = RBTree.size(credit.used);
-          let used = {
-            credit with used = RBTree.insert(credit.used, Nat.compare, index, { start = order_id; length = RBTree.size(incoming_sells) + RBTree.size(incoming_buys) })
+        case (#Credit) switch (Sleepy.findActiveCredit(user, now, credits)) {
+          case (#Err) return #Err(#Unauthorized(#Credit(#OutOfCredit)));
+          case (#Ok(cr_id, cr)) {
+            credits := RBTree.insert(credits, Nat.compare, cr_id, { cr with used = cr.used + 1 });
+            if (user.credits_unused > 0) user := {
+              user with credits_unused = user.credits_unused - 1
+            };
+            #Credit;
           };
-          credits := RBTree.insert(credits, Nat.compare, credit_id, used);
-          user := {
-            user with credits_remaining = user.credits_remaining - 1;
-          };
-          #Credit({ id = credit_id; used_index = index });
         };
         case (#ICRC2 payment) {
           let token = ICRC_1_Types.genActor(payment.canister_id);
@@ -369,7 +376,7 @@ shared (install) persistent actor class Canister(
           };
           let xfer = switch (await token.icrc2_transfer_from(xfer_arg)) {
             case (#Err err) return #Err(#Unauthorized(#ICRC2(#TransferFromFailed err)));
-            case (#Ok block_id) block_id;
+            case (#Ok xfer_id) xfer_id;
           };
           user := getUser(caller);
           subaccount := Sleepy.getSubaccount(user, arg_subaccount);
@@ -434,7 +441,7 @@ shared (install) persistent actor class Canister(
       place_locked = null;
       subaccounts = RBTree.empty();
       subaccount_ids = RBTree.empty();
-      credits_remaining = 0;
+      credits_unused = 0;
       credits_by_expiry = RBTree.empty();
     });
   };

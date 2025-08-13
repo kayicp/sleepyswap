@@ -108,12 +108,12 @@ module {
   type Call<OkT, ErrT> = {
     #Calling : { caller : Principal; timestamp : Nat64 };
     #Called : Result.Type<OkT, ErrT>;
-  }; // attempts = calls / 2
+  };
   public type Trade = {
     maker : { id : Nat; fee : Nat }; // track amount and account too?
     taker : { id : Nat; fee : Nat };
 
-    maker_to_escrow : RBTree.Type<Nat64, Call<Nat, ICRC_1_Types.TransferFromError>>;
+    maker_to_escrow : RBTree.Type<Nat64, Call<Nat, ICRC_1_Types.TransferFromError>>; // attempts = calls / 2
     taker_to_maker : RBTree.Type<Nat64, Call<Nat, ICRC_1_Types.TransferFromError>>;
     escrow_to : {
       receiver : Nat; // order id of maker (if taker_to_maker fails), or order id of taker (if taker_to_maker succeeds)
@@ -171,26 +171,30 @@ module {
     };
   };
   public type Credit = {
-    // todo: redesign credit system?
     owner : Nat; // user id
-    credited_at : Nat64;
     amount : Nat;
-    used : RBTree.Type<(index : Nat), { start : Nat; length : Nat }>;
-    reason : {
-      #Place : { start : Nat; length : Nat }; // order ids
-      /* #Match : { trade_id : Nat }; */
-      /* #Topup : { xfer : Nat } */
-    };
+    used : Nat;
   };
+  public type Credits = RBTree.Type<Nat, Credit>;
   public type User = {
     id : Nat;
     place_locked : ?Nat64;
     subaccounts : RBTree.Type<Blob, Subaccount>;
     subaccount_ids : RBTree.Type<Nat, Blob>;
-    credits_remaining : Nat;
-    credits_by_expiry : RBTree.Type<(expires_at : Nat64), (credit_id : Nat)>; // todo: cant do this, credits might share same expiry... redesign anything that has expiry, even if it's consuming more storage
+    credits_unused : Nat;
+    credits_by_expiry : RBTree.Type<Nat64, RBTree.Type<Nat, ()>>;
   };
   public type Users = RBTree.Type<Principal, User>;
+  public func findActiveCredit(u : User, now : Nat64, cs : Credits) : Result.Type<(Nat, Credit), ()> {
+    label finding_active for ((expiry, cids) in RBTree.entries(u.credits_by_expiry)) {
+      if (now > expiry) continue finding_active;
+      for ((cid, _) in RBTree.entries(cids)) switch (RBTree.get(cs, Nat.compare, cid)) {
+        case (?credit) if (credit.used < credit.amount) return #Ok(cid, credit);
+        case _ ();
+      };
+    };
+    #Err;
+  };
 
   type OrderArg = { price : Nat; amount : Nat; expires_at : ?Nat64 };
   public type PlaceArg = {
@@ -341,7 +345,7 @@ module {
   public type ICRC2_Authorized = { canister_id : Principal; xfer : Nat };
   public type Authorized = {
     #None;
-    #Credit : { id : Nat; used_index : Nat };
+    #Credit;
     #ICRC2 : ICRC2_Authorized;
   };
   type None_Failure = {
@@ -377,16 +381,9 @@ module {
 
   public func authNoneCheck(now : Nat64, none_available_time : Nat64, last_placer : Principal) : Result.Type<(), { #None : None_Failure }> = if (now < none_available_time) return #Err(#None(#TemporarilyUnavailable { time = now; available_time = none_available_time; used_by = last_placer })) else #Ok;
 
-  public func authCreditCheck(user : User, now : Nat64, credits : RBTree.Type<Nat, Credit>) : Result.Type<(Nat, Credit), { #Credit : Credit_Failure }> {
-    label checking for ((expires_at, credit_id) in RBTree.entries(user.credits_by_expiry)) {
-      if (now > expires_at) continue checking;
-      let credit = switch (RBTree.get(credits, Nat.compare, credit_id)) {
-        case (?found) found;
-        case _ continue checking;
-      };
-      if (credit.amount > RBTree.size(credit.used)) return #Ok(credit_id, credit);
-    };
-    #Err(#Credit(#OutOfCredit));
+  public func authCreditCheck(user : User, now : Nat64, credits : Credits) : Result.Type<(), { #Credit : Credit_Failure }> = switch (findActiveCredit(user, now, credits)) {
+    case (#Ok _) #Ok;
+    case (#Err) #Err(#Credit(#OutOfCredit));
   };
 
   type ICRC2_Selected = { canister_id : Principal; amount : Nat; fee : Nat };
@@ -420,14 +417,14 @@ module {
     } else #Ok { auth with amount = expected_amount; fee };
   };
 
-  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credits : RBTree.Type<Nat, Credit>, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<{ #None; #Credit : (Nat, Credit); #ICRC2 : ICRC2_Selected }, ()> {
+  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credits : Credits, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<{ #None; #Credit; #ICRC2 : ICRC2_Selected }, ()> {
     switch (authNoneCheck(now, none_available_time, last_placer)) {
       case (#Err(#None err)) failures.add(#None err);
       case _ return #Ok(#None);
     };
     switch (authCreditCheck(user, now, credits)) {
       case (#Err(#Credit err)) failures.add(#Credit err);
-      case (#Ok found) return #Ok(#Credit found);
+      case (#Ok) return #Ok(#Credit);
     };
     if (icrc2_rates.size() == 0) {
       failures.add(#ICRC2(#BadCanister { canister_id = Management.principal(); expected_canister_ids = [] }));
