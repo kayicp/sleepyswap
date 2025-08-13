@@ -42,6 +42,7 @@ shared (install) persistent actor class Canister(
   var last_none_placed = 0 : Nat64;
   var last_none_placer = Management.principal();
 
+  var credit_id = 0;
   var credits = RBTree.empty<Nat, Sleepy.Credit>();
   var credits_by_expiry = RBTree.empty<Nat64, RBTree.Type<Nat, ()>>();
 
@@ -73,6 +74,10 @@ shared (install) persistent actor class Canister(
     let arg_subaccount = Account.denull(arg.subaccount);
     var subaccount = Sleepy.getSubaccount(user, arg_subaccount);
 
+    func unlock<Return>(ret : Return) : Return {
+      ignore saveUser(caller, { user with place_locked = null });
+      ret;
+    };
     try {
       let sell_token_id = switch (Value.metaPrincipal(metadata, Sleepy.SELL_TOKEN)) {
         case (?found) found;
@@ -321,10 +326,6 @@ shared (install) persistent actor class Canister(
       };
       is_locker := true;
       user := saveUser(caller, { Sleepy.saveSubaccount(user, arg_subaccount, subaccount) with place_locked = ?now });
-      func unlock<Return>(ret : Return) : Return {
-        ignore saveUser(caller, { user with place_locked = null });
-        ret;
-      };
 
       let self_account = { owner = self; subaccount = null };
       let self_approval = { account = user_account; spender = self_account };
@@ -351,6 +352,26 @@ shared (install) persistent actor class Canister(
         case (#None) {
           last_none_placed := now;
           last_none_placer := caller;
+          let min_reward = 1;
+          var reward = Value.getNat(metadata, Sleepy.AUTH_NONE_CREDIT_REWARD, 0);
+          if (reward < min_reward) {
+            reward := min_reward;
+            metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_CREDIT_REWARD, ?reward);
+          };
+          let min_reward_expiry = Time64.DAYS(1);
+          var reward_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_CREDIT_REWARD_EXPIRY, 0)));
+          if (reward_expiry < min_reward_expiry) {
+            reward_expiry := min_reward_expiry;
+            metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_CREDIT_REWARD_EXPIRY, ?Nat64.toNat(reward_expiry / 1_000_000_000));
+          };
+          let new_cid = credit_id;
+          credits := RBTree.insert(credits, Nat.compare, new_cid, { owner = user.id; amount = reward; used = 0 });
+          let expiring_credits = switch (RBTree.get(credits_by_expiry, Nat64.compare, reward_expiry)) {
+            case (?found) found;
+            case _ RBTree.empty();
+          };
+          credits_by_expiry := RBTree.insert(credits_by_expiry, Nat64.compare, reward_expiry, RBTree.insert(expiring_credits, Nat.compare, new_cid, ()));
+          user := Sleepy.addCredit(user, new_cid, reward, reward_expiry);
           #None;
         };
         case (#Credit) switch (Sleepy.findActiveCredit(user, now, credits)) {
@@ -380,9 +401,31 @@ shared (install) persistent actor class Canister(
           };
           user := getUser(caller);
           subaccount := Sleepy.getSubaccount(user, arg_subaccount);
+          let min_reward = 3;
+          var reward = Value.getNat(metadata, Sleepy.AUTH_ICRC2_CREDIT_REWARD, 0);
+          if (reward < min_reward) {
+            reward := min_reward;
+            metadata := Value.setNat(metadata, Sleepy.AUTH_ICRC2_CREDIT_REWARD, ?reward);
+          };
+          let min_reward_expiry = Time64.DAYS(4);
+          var reward_expiry = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_CREDIT_REWARD_EXPIRY, 0)));
+          if (reward_expiry < min_reward_expiry) {
+            reward_expiry := min_reward_expiry;
+            metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_CREDIT_REWARD_EXPIRY, ?Nat64.toNat(reward_expiry / 1_000_000_000));
+          };
+          let new_cid = credit_id;
+          credits := RBTree.insert(credits, Nat.compare, new_cid, { owner = user.id; amount = reward; used = 0 });
+          let expiring_credits = switch (RBTree.get(credits_by_expiry, Nat64.compare, reward_expiry)) {
+            case (?found) found;
+            case _ RBTree.empty();
+          };
+          credits_by_expiry := RBTree.insert(credits_by_expiry, Nat64.compare, reward_expiry, RBTree.insert(expiring_credits, Nat.compare, new_cid, ()));
+          user := Sleepy.addCredit(user, new_cid, reward, reward_expiry);
           #ICRC2 { payment with xfer };
         };
       };
+
+      let res_buff = Buffer.Buffer<Nat>(RBTree.size(incoming_sells) + RBTree.size(incoming_buys));
       for ((incoming_price, incoming_detail) in RBTree.entries(incoming_sells)) {
         let new_oid = order_id;
         let new_order = Sleepy.newOrder(now, user.id, subaccount.id, false, incoming_price, incoming_detail, authorized);
@@ -394,6 +437,8 @@ shared (install) persistent actor class Canister(
         var price = Sleepy.getPrice(sell_book, new_order.price);
         price := Sleepy.priceNewOrder(price, new_oid, new_order);
         sell_book := Sleepy.savePrice(sell_book, new_order, price);
+
+        res_buff.add(new_oid);
       };
       sell_amount := {
         sell_amount with initial = sell_amount.initial + total_incoming_sell_amount
@@ -410,6 +455,8 @@ shared (install) persistent actor class Canister(
         var price = Sleepy.getPrice(buy_book, new_order.price);
         price := Sleepy.priceNewOrder(price, new_oid, new_order);
         buy_book := Sleepy.savePrice(buy_book, new_order, price);
+
+        res_buff.add(new_oid);
       };
       buy_amount := {
         buy_amount with initial = buy_amount.initial + total_incoming_buy_amount
@@ -417,11 +464,10 @@ shared (install) persistent actor class Canister(
       user := Sleepy.saveSubaccount(user, arg_subaccount, subaccount);
       unlock();
 
-      // todo: trim users
-      // todo: trim dedupes
-      #Ok([]);
+      // todo: blockify
+      #Ok(Buffer.toArray(res_buff));
     } catch e {
-      if (is_locker) ignore saveUser(caller, { user with place_locked = null });
+      if (is_locker) unlock();
       Error.error(e);
     };
   };
@@ -431,7 +477,7 @@ shared (install) persistent actor class Canister(
   };
 
   public shared ({ caller }) func sleepyswap_match() : async () {
-
+    // todo: archive blocks
   };
 
   func getUser(p : Principal) : Sleepy.User = switch (RBTree.get(users, Principal.compare, p)) {

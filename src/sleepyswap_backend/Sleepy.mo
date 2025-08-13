@@ -36,12 +36,11 @@ module {
   public let MAX_ORDER_EXPIRY = "sleepyswap:max_order_expiry";
   public let MIN_ORDER_EXPIRY = "sleepyswap:min_order_expiry";
   public let AUTH_NONE_RATE_LIMIT = "sleepyswap:auth_none_rate_limit"; // millisecond
-  public let AUTH_NONE_CREDIT_REWARD = "sleepyswap:auth_none_credit_reward"; // 1
-  // todo: add when credit expiry
-  // public let AUTH_CREDIT_PLACE_EXPIRY = "sleepyswap:auth_credit_place_expiry";
-  // public let AUTH_CREDIT_MATCH_EXPIRY = "sleepyswap:auth_credit_match_expiry";
+  public let AUTH_NONE_CREDIT_REWARD = "sleepyswap:auth_none_credit_reward"; // 1 (waiting)
+  public let AUTH_NONE_CREDIT_REWARD_EXPIRY = "sleepyswap:auth_none_credit_reward_expiry"; // 3 days
   public let AUTH_ICRC2_RATES = "sleepyswap:auth_icrc2_fee_rates"; // map(canisterid, amount)
-  public let AUTH_ICRC2_CREDIT_REWARD = "sleepyswap:auth_icrc2_credit_reward"; // 2
+  public let AUTH_ICRC2_CREDIT_REWARD = "sleepyswap:auth_icrc2_credit_reward"; // 3 (pay, transfer fee, waiting)
+  public let AUTH_ICRC2_CREDIT_REWARD_EXPIRY = "sleepyswap:auth_icrc2_credit_reward_expiry"; // 3 days
 
   public let TX_WINDOW = "sleepyswap:tx_window";
   public let PERMITTED_DRIFT = "sleepyswap:permitted_drift";
@@ -194,6 +193,16 @@ module {
       };
     };
     #Err;
+  };
+  public func addCredit(u : User, cid : Nat, amount : Nat, expiry : Nat64) : User {
+    let expiring_credits = switch (RBTree.get(u.credits_by_expiry, Nat64.compare, expiry)) {
+      case (?found) found;
+      case _ RBTree.empty();
+    };
+    {
+      u with credits_unused = u.credits_unused + amount;
+      credits_by_expiry = RBTree.insert(u.credits_by_expiry, Nat64.compare, expiry, RBTree.insert(expiring_credits, Nat.compare, cid, ()));
+    };
   };
 
   type OrderArg = { price : Nat; amount : Nat; expires_at : ?Nat64 };
