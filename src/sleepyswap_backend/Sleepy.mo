@@ -10,7 +10,6 @@ import Iter "mo:base/Iter";
 import Principal "mo:base/Principal";
 import Text "mo:base/Text";
 import Buffer "mo:base/Buffer";
-import Option "mo:base/Option";
 import OptionX "../util/motoko/Option";
 import Value "../util/motoko/Value";
 import Queue "../util/motoko/StableCollections/Queue";
@@ -474,5 +473,18 @@ module {
       } else return #Ok(#ICRC2 { canister_id = p; amount = amt; fee });
     };
     #Err;
+  };
+
+  type Arg = {
+    #Place : PlaceArg;
+    #Cancel : ();
+    #Match : ();
+  };
+
+  public func genValue(
+    caller : Principal,
+    arg : Arg,
+  ) : Value.Type {
+    #Map([]);
   };
 };
