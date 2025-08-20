@@ -172,7 +172,7 @@ shared (install) persistent actor class Canister(
       let min_expires_at = now + min_expiry;
       let default_expires_at = now + default_expiry;
       var total_incoming_sell_amount = 0;
-      var incoming_sells = RBTree.empty<(price : Nat), { index : Nat; amount : Nat; expires_at : Nat64 }>();
+      var incoming_sells : Sleepy.Incoming = RBTree.empty();
       for (incoming in arg.sell_orders.vals()) {
         let incoming_index = RBTree.size(incoming_sells);
 
@@ -201,7 +201,7 @@ shared (install) persistent actor class Canister(
       };
 
       var total_incoming_buy_amount = 0;
-      var incoming_buys = RBTree.empty<(price : Nat), { index : Nat; amount : Nat; expires_at : Nat64 }>();
+      var incoming_buys : Sleepy.Incoming = RBTree.empty();
       for (incoming in arg.buy_orders.vals()) {
         let incoming_index = RBTree.size(incoming_buys);
 

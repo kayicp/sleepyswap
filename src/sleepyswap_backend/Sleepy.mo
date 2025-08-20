@@ -475,16 +475,75 @@ module {
     #Err;
   };
 
+  public type Incoming = RBTree.Type<(price : Nat), { index : Nat; amount : Nat; expires_at : Nat64 }>;
   type Arg = {
-    #Place : PlaceArg;
+    #Place : {
+      arg : PlaceArg;
+      auth : Authorized;
+      buys : Incoming;
+      sells : Incoming;
+    };
     #Cancel : ();
     #Match : ();
+  };
+  func authMap(auth : Authorized) : Value.Metadata {
+    var map : Value.Metadata = RBTree.empty();
+    switch auth {
+      case (#None) map := Value.setText(map, "via", ?"none");
+      case (#Credit) map := Value.setText(map, "via", ?"credit");
+      case (#ICRC2 token) {
+        map := Value.setText(map, "via", ?"icrc2");
+        map := Value.setPrincipal(map, "token", ?token.canister_id);
+        map := Value.setNat(map, "xfer", ?token.xfer);
+      };
+    };
+    map;
+  };
+
+  func orderValues(incoming : Incoming) : [Value.Type] {
+    let buff = Buffer.Buffer<Value.Type>(RBTree.size(incoming));
+    for ((price, { amount; expires_at }) in RBTree.entries(incoming)) {
+      var map : Value.Metadata = RBTree.empty();
+      map := Value.setNat(map, "price", ?price);
+      map := Value.setNat(map, "amount", ?amount);
+      map := Value.setNat(map, "expires_at", ?(Nat64.toNat(expires_at)));
+      buff.add(#Map(RBTree.array(map)));
+    };
+    Buffer.toArray(buff);
   };
 
   public func genValue(
     caller : Principal,
     arg : Arg,
+    now : Nat64,
+    phash : ?Blob,
   ) : Value.Type {
-    #Map([]);
+    var tx : Value.Metadata = RBTree.empty();
+    var map : Value.Metadata = RBTree.empty();
+    map := Value.setNat(map, "ts", ?Nat64.toNat(now));
+    switch arg {
+      case (#Place place) {
+        switch (place.arg.authorization) {
+          case (?_found) tx := Value.setMap(tx, "auth", authMap(place.auth));
+          case _ map := Value.setMap(map, "auth", authMap(place.auth));
+        };
+        map := Value.setText(map, "op", ?"place");
+        tx := Value.setAccountP(tx, "from", ?{ place.arg with owner = caller });
+        tx := Value.setBlob(tx, "memo", place.arg.memo);
+        switch (place.arg.created_at_time) {
+          case (?found) tx := Value.setNat(tx, "ts", ?Nat64.toNat(found));
+          case _ ();
+        };
+        tx := Value.setArray(tx, "sells", orderValues(place.sells));
+        tx := Value.setArray(tx, "buys", orderValues(place.buys));
+      };
+      case _ (); // reject
+    };
+    map := Value.setMap(map, "tx", tx);
+    switch phash {
+      case (?found) map := Value.setBlob(map, "phash", ?found);
+      case _ ();
+    };
+    #Map(RBTree.array(map));
   };
 };
