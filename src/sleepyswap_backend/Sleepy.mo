@@ -479,9 +479,9 @@ module {
   type Arg = {
     #Place : {
       arg : PlaceArg;
-      auth : Authorized;
-      buys : Incoming;
-      sells : Incoming;
+      authorized : Authorized;
+      incoming_buys : Incoming;
+      incoming_sells : Incoming;
     };
     #Cancel : ();
     #Match : ();
@@ -514,9 +514,9 @@ module {
 
   public func genValue(
     caller : Principal,
-    arg : Arg,
     now : Nat64,
     phash : ?Blob,
+    arg : Arg,
   ) : Value.Type {
     var tx : Value.Metadata = RBTree.empty();
     var map : Value.Metadata = RBTree.empty();
@@ -524,8 +524,8 @@ module {
     switch arg {
       case (#Place place) {
         switch (place.arg.authorization) {
-          case (?_found) tx := Value.setMap(tx, "auth", authMap(place.auth));
-          case _ map := Value.setMap(map, "auth", authMap(place.auth));
+          case (?_found) tx := Value.setMap(tx, "auth", authMap(place.authorized));
+          case _ map := Value.setMap(map, "auth", authMap(place.authorized));
         };
         map := Value.setText(map, "op", ?"place");
         tx := Value.setAccountP(tx, "from", ?{ place.arg with owner = caller });
@@ -534,8 +534,8 @@ module {
           case (?found) tx := Value.setNat(tx, "ts", ?Nat64.toNat(found));
           case _ ();
         };
-        tx := Value.setArray(tx, "sells", orderValues(place.sells));
-        tx := Value.setArray(tx, "buys", orderValues(place.buys));
+        tx := Value.setArray(tx, "sells", orderValues(place.incoming_sells));
+        tx := Value.setArray(tx, "buys", orderValues(place.incoming_buys));
       };
       case _ (); // reject
     };

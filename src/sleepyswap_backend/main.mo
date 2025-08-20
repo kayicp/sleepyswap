@@ -464,7 +464,15 @@ shared (install) persistent actor class Canister(
       user := Sleepy.saveSubaccount(user, arg_subaccount, subaccount);
       unlock();
 
-      // todo: blockify
+      let phash = switch (RBTree.max(blocks)) {
+        case (?(_, max_block)) ?Value.hash(max_block);
+        case _ null;
+      };
+      let new_block = Sleepy.genValue(caller, now, phash, #Place { arg; authorized; incoming_buys; incoming_sells });
+      let new_block_id = block_id;
+      blocks := RBTree.insert(blocks, Nat.compare, new_block_id, new_block);
+      block_id += 1;
+
       #Ok(Buffer.toArray(res_buff));
     } catch e {
       if (is_locker) unlock();
