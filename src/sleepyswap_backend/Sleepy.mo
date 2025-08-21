@@ -179,8 +179,7 @@ module {
     place_locked : ?Nat64;
     subaccounts : RBTree.Type<Blob, Subaccount>;
     subaccount_ids : RBTree.Type<Nat, Blob>;
-    credits_unused : Nat;
-    credits_by_expiry : RBTree.Type<Nat64, RBTree.Type<Nat, ()>>;
+    credits_by_expiry : Expiries;
   };
   public type Users = RBTree.Type<Principal, User>;
   public func findActiveCredit(u : User, now : Nat64, cs : Credits) : Result.Type<(Nat, Credit), ()> {
@@ -192,16 +191,6 @@ module {
       };
     };
     #Err;
-  };
-  public func addCredit(u : User, cid : Nat, amount : Nat, expiry : Nat64) : User {
-    let expiring_credits = switch (RBTree.get(u.credits_by_expiry, Nat64.compare, expiry)) {
-      case (?found) found;
-      case _ RBTree.empty();
-    };
-    {
-      u with credits_unused = u.credits_unused + amount;
-      credits_by_expiry = RBTree.insert(u.credits_by_expiry, Nat64.compare, expiry, RBTree.insert(expiring_credits, Nat.compare, cid, ()));
-    };
   };
 
   type OrderArg = { price : Nat; amount : Nat; expires_at : ?Nat64 };
@@ -545,5 +534,15 @@ module {
       case _ ();
     };
     #Map(RBTree.array(map));
+  };
+
+  public type Expiries = RBTree.Type<Nat64, RBTree.Type<Nat, ()>>;
+  public func saveExpiry(expiries : Expiries, expiry : Nat64, id : Nat) : Expiries {
+    var expiring_items = switch (RBTree.get(expiries, Nat64.compare, expiry)) {
+      case (?found) found;
+      case _ RBTree.empty();
+    };
+    expiring_items := RBTree.insert(expiring_items, Nat.compare, id, ());
+    RBTree.insert(expiries, Nat64.compare, expiry, expiring_items);
   };
 };
