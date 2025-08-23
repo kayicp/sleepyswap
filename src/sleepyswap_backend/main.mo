@@ -478,13 +478,106 @@ shared (install) persistent actor class Canister(
       Error.error(e);
     };
   };
+  // todo: include credit reward in block
+  // todo: include credit reward in return(?)
 
+  // todo:
   public shared ({ caller }) func sleepyswap_cancel(arg : Sleepy.CancelArg) : async Sleepy.CancelResult {
-    [];
+    let user_account = { owner = caller; subaccount = arg.subaccount };
+    if (not Account.validate(user_account)) return Error.text("Caller account is not valid");
+
+    let batch_size = arg.orders.size();
+    if (batch_size == 0) return Error.text("Orders cannot be empty");
+    let max_batch = Value.getNat(metadata, Sleepy.MAX_ORDER_BATCH, 0);
+    if (max_batch > 0 and batch_size > max_batch) return #Err(#BatchTooLarge { batch_size = batch_size; maximum_batch_size = max_batch });
+
+    var user = switch (RBTree.get(users, Principal.compare, caller)) {
+      case (?found) found;
+      case _ return Error.text("Caller is not a user");
+    };
+    let arg_subaccount = Account.denull(arg.subaccount);
+    var subaccount = Sleepy.getSubaccount(user, arg_subaccount);
+
+    let res_buff = Buffer.Buffer<Sleepy.OrderCancelResult>(batch_size);
+    var close_set = RBTree.empty<Nat, ()>();
+    let def_p = Management.principal();
+    let now = Time64.nanos();
+    // todo: remove the order from the book
+    label looping for (oid in arg.orders.vals()) {
+      var order = switch (RBTree.get(orders, Nat.compare, oid)) {
+        case (?found) found;
+        case _ {
+          res_buff.add(#NotFound);
+          continue looping;
+        };
+      };
+      if (order.owner != user.id) {
+        let p = Option.get(RBTree.get(user_ids, Nat.compare, order.owner), def_p);
+        res_buff.add(#NotOwner { owner = p; caller });
+        continue looping;
+      };
+      if (order.subaccount != subaccount.id) {
+        let s = Option.get(RBTree.get(user.subaccount_ids, Nat.compare, order.subaccount), "" : Blob);
+        res_buff.add(#NotSubaccount { subaccount = s; caller_subaccount = arg_subaccount });
+        continue looping;
+      };
+      switch (order.closed) {
+        case (?found) {
+          res_buff.add(#Closed found);
+          continue looping;
+        };
+        case _ ();
+      };
+      switch (RBTree.maxKey(order.trades)) {
+        case (?max) switch (RBTree.get(trades, Nat.compare, max)) {
+          case (?trade) switch (Sleepy.tradeStory(trade)) {
+            case (#MakerToEscrow(#Pending)) ();
+            case (#MakerToEscrow(#Failed _)) ();
+            case (#EscrowRefundMaker(#Ok _)) ();
+            case (#EscrowToTaker(#Ok _)) ();
+            case _ {
+              res_buff.add(#Locked { trade = max });
+              continue looping;
+            };
+          };
+          case _ ();
+        };
+        case _ ();
+      };
+      order := { order with closed = ?{ at = now; reason = #Canceled } };
+      orders := RBTree.insert(orders, Nat.compare, oid, order);
+      res_buff.add(#Ok);
+      close_set := RBTree.insert(close_set, Nat.compare, oid, ());
+    };
+    let closes = RBTree.arrayKey(close_set);
+    if (closes.size() > 0) {
+      // todo: blockify
+    };
+    #Ok(Buffer.toArray(res_buff));
+  };
+  // todo: rename sleepyswap to something else
+  public shared ({ caller }) func sleepyswap_match() : async () {
+
   };
 
-  public shared ({ caller }) func sleepyswap_match() : async () {
-    // todo: archive blocks
+  public shared ({ caller }) func sleepyswap_settle() : async () {
+
+  };
+
+  public shared ({ caller }) func sleepyswap_archive() : async () {
+
+  };
+
+  public shared ({ caller }) func sleepyswap_trim_orders() : async () {
+
+  };
+
+  public shared ({ caller }) func sleepyswap_trim_dedupes() : async () {
+
+  };
+
+  public shared ({ caller }) func sleepyswap_trim_credits() : async () {
+
   };
 
   func getUser(p : Principal) : Sleepy.User = switch (RBTree.get(users, Principal.compare, p)) {

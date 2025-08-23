@@ -44,8 +44,18 @@ module {
   public let TX_WINDOW = "sleepyswap:tx_window";
   public let PERMITTED_DRIFT = "sleepyswap:permitted_drift";
 
-  // todo: add max memo size
+  public let MIN_MEMO = "sleepyswap:min_memo_size";
+  public let MAX_MEMO = "sleepyswap:max_memo_size";
 
+  type OrderClosed = {
+    at : Nat64;
+    reason : {
+      #Filled;
+      #Expired;
+      #Canceled;
+      #Failed : { trade : Nat };
+    };
+  };
   public type Order = {
     created_at : Nat64;
     owner : Nat; // user id
@@ -54,24 +64,9 @@ module {
     price : Nat;
     amount : Amount; // in sell unit
     expires_at : Nat64;
-    trades : RBTree.Type<Nat, ()>; // trade ids
+    trades : RBTree.Type<Nat, ()>;
     authorization : Authorized;
-    closed : ?{
-      at : Nat64;
-      reason : {
-        #Filled;
-        #Expired;
-        #Canceled;
-        #InsufficientFunds : {
-          balance : Nat;
-          minimum_balance : Nat;
-        };
-        #InsufficientAllowance : {
-          allowance : Nat;
-          minimum_allowance : Nat;
-        };
-      };
-    };
+    closed : ?OrderClosed;
   };
   public func newOrder(now : Nat64, user_id : Nat, subacc_id : Nat, is_buy : Bool, price : Nat, { amount : Nat; expires_at : Nat64 }, auth : Authorized) : Order = {
     created_at = now;
@@ -104,7 +99,7 @@ module {
     RBTree.insert(book, Nat.compare, o.price, p);
   } else RBTree.delete(book, Nat.compare, o.price);
   type Call<OkT, ErrT> = {
-    #Calling : { caller : Principal; timestamp : Nat64 };
+    #Calling : { caller : Principal };
     #Called : Result.Type<OkT, ErrT>;
   };
   public type Trade = {
@@ -116,6 +111,88 @@ module {
     escrow_to : {
       receiver : Nat; // order id of maker (if taker_to_maker fails), or order id of taker (if taker_to_maker succeeds)
       transfer : RBTree.Type<Nat64, Call<Nat, ICRC_1_Types.TransferError>>;
+    };
+  };
+  type XferOk = { time : Nat64; xfer : Nat };
+  type XferErr = { time : Nat64; err : ICRC_1_Types.TransferFromError };
+  type TradeStory = {
+    #MakerToEscrow : {
+      #Pending;
+      #Transferring : { time : Nat64; caller : Principal };
+      #Failed : XferErr;
+    };
+    #TakerToMaker : {
+      #Pending : { maker_to_escrow : XferOk };
+      #Transferring : {
+        time : Nat64;
+        caller : Principal;
+        maker_to_escrow : XferOk;
+      };
+    };
+    #EscrowRefundMaker : {
+      #Pending : { maker_to_escrow : XferOk; taker_to_maker : XferErr };
+      #Transferring : {
+        time : Nat64;
+        caller : Principal;
+        maker_to_escrow : XferOk;
+        taker_to_maker : XferErr;
+      };
+      #Failed : {
+        time : Nat64;
+        err : ICRC_1_Types.TransferError;
+        maker_to_escrow : XferOk;
+        taker_to_maker : XferErr;
+      };
+      #Ok : {
+        time : Nat64;
+        xfer : Nat;
+        maker_to_escrow : XferOk;
+        taker_to_maker : XferErr;
+      };
+    };
+    #EscrowToTaker : {
+      #Pending : { maker_to_escrow : XferOk; taker_to_maker : XferOk };
+      #Transferring : {
+        time : Nat64;
+        caller : Principal;
+        maker_to_escrow : XferOk;
+        taker_to_maker : XferOk;
+      };
+      #Failed : {
+        time : Nat64;
+        err : ICRC_1_Types.TransferError;
+        maker_to_escrow : XferOk;
+        taker_to_maker : XferOk;
+      };
+      #Ok : {
+        time : Nat64;
+        xfer : Nat;
+        maker_to_escrow : XferOk;
+        taker_to_maker : XferOk;
+      };
+    };
+  };
+  public func tradeStory(t : Trade) : TradeStory {
+    let maker_to_escrow = switch (RBTree.max(t.maker_to_escrow)) {
+      case null return #MakerToEscrow(#Pending);
+      case (?(time, #Calling { caller })) return #MakerToEscrow(#Transferring { time; caller });
+      case (?(time, #Called(#Err err))) return #MakerToEscrow(#Failed { time; err });
+      case (?(time, #Called(#Ok xfer))) ({ time; xfer });
+    };
+    let t2m = switch (RBTree.max(t.taker_to_maker)) {
+      case null return #TakerToMaker(#Pending { maker_to_escrow });
+      case (?(time, #Calling { caller })) return #TakerToMaker(#Transferring { time; caller; maker_to_escrow });
+      case (?(time, #Called res)) ({ time; res });
+    };
+    switch (t2m.res, RBTree.max(t.escrow_to.transfer)) {
+      case (#Err err, null) #EscrowRefundMaker(#Pending { maker_to_escrow; taker_to_maker = { t2m with err } });
+      case (#Err err, ?(time, #Calling { caller })) #EscrowRefundMaker(#Transferring { time; caller; maker_to_escrow; taker_to_maker = { t2m with err } });
+      case (#Err errZ, ?(time, #Called(#Err err))) #EscrowRefundMaker(#Failed { time; err; maker_to_escrow; taker_to_maker = { t2m with err = errZ } });
+      case (#Err err, ?(time, #Called(#Ok xfer))) #EscrowRefundMaker(#Ok { time; xfer; maker_to_escrow; taker_to_maker = { t2m with err } });
+      case (#Ok xfer, null) #EscrowToTaker(#Pending { maker_to_escrow; taker_to_maker = { t2m with xfer } });
+      case (#Ok xfer, ?(time, #Calling { caller })) #EscrowToTaker(#Transferring { time; caller; maker_to_escrow; taker_to_maker = { t2m with xfer } });
+      case (#Ok xfer, ?(time, #Called(#Err err))) #EscrowToTaker(#Failed { time; err; maker_to_escrow; taker_to_maker = { t2m with xfer } });
+      case (#Ok xferZ, ?(time, #Called(#Ok xfer))) #EscrowToTaker(#Ok { time; xfer; maker_to_escrow; taker_to_maker = { t2m with xfer = xferZ } });
     };
   };
   type Amount = { initial : Nat; locked : Nat; filled : Nat };
@@ -132,7 +209,7 @@ module {
     sell_amount : Amount; // in sell unit
     buys : RBTree.Type<(price : Nat), (order : Nat)>;
     buy_amount : Amount; // in buy unit
-    trades : RBTree.Type<(id : Nat), ()>;
+    trades : RBTree.Type<(id : Nat), ()>; // ongoing/finished trade ids
   };
   type Subaccounts = RBTree.Type<Blob, Subaccount>;
   public func getSubaccount<K>(user : User, subaccount : Blob) : Subaccount = switch (RBTree.get(user.subaccounts, Blob.compare, subaccount)) {
@@ -314,12 +391,23 @@ module {
     #equal;
   };
 
-  public type CancelArg = [{ id : Nat; subaccount : ?Blob }];
+  public type CancelArg = {
+    subaccount : ?Blob;
+    orders : [Nat];
+  };
   public type CancelError = {
     #GenericError : Error.Type;
-    #GenericBatchError : Error.Type;
+    #BatchTooLarge : { batch_size : Nat; maximum_batch_size : Nat };
   };
-  public type CancelResult = [?Result.Type<(), CancelError>];
+  public type OrderCancelResult = {
+    #Ok;
+    #NotFound;
+    #NotOwner : { owner : Principal; caller : Principal };
+    #NotSubaccount : { subaccount : Blob; caller_subaccount : Blob };
+    #Closed : OrderClosed;
+    #Locked : { trade : Nat };
+  };
+  public type CancelResult = Result.Type<[OrderCancelResult], CancelError>;
 
   public func recycleId<K>(ids : RBTree.Type<Nat, K>) : Nat = switch (RBTree.minKey(ids), RBTree.maxKey(ids)) {
     case (?min_id, ?max_id) if (min_id > 0) min_id - 1 else max_id + 1;
