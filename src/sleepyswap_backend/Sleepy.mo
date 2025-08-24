@@ -64,7 +64,7 @@ module {
     price : Nat;
     amount : Amount; // in sell unit
     expires_at : Nat64;
-    trades : RBTree.Type<Nat, ()>;
+    trades : IDs;
     authorization : Authorized;
     closed : ?OrderClosed;
   };
@@ -80,24 +80,34 @@ module {
     trades = RBTree.empty();
     closed = null;
   };
-  public type Price = {
-    amount : Amount;
-    orders : RBTree.Type<Nat, ()>;
-  };
-  public func getPrice(book : RBTree.Type<Nat, Price>, price : Nat) : Price = switch (RBTree.get(book, Nat.compare, price)) {
+  public type Price = { amount : Amount; orders : IDs };
+  public type Book = RBTree.Type<Nat, Price>;
+  public func getPrice(book : Book, price : Nat) : Price = switch (RBTree.get(book, Nat.compare, price)) {
     case (?found) found;
     case _ ({
       amount = newAmount(0);
       orders = RBTree.empty();
     });
   };
-  public func priceNewOrder(p : Price, oid : Nat, o : Order) : Price = ({
-    amount = { p.amount with initial = p.amount.initial + o.amount.initial };
-    orders = RBTree.insert(p.orders, Nat.compare, oid, ());
-  });
-  public func savePrice(book : RBTree.Type<Nat, Price>, o : Order, p : Price) : RBTree.Type<Nat, Price> = if (p.amount.initial > 0) {
+  public func savePrice(book : Book, o : Order, p : Price) : Book = if (RBTree.size(p.orders) > 0) {
     RBTree.insert(book, Nat.compare, o.price, p);
   } else RBTree.delete(book, Nat.compare, o.price);
+  public func insertPrice(book : Book, oid : Nat, o : Order) : Book {
+    var p = getPrice(book, o.price);
+    let amount = { p.amount with initial = p.amount.initial + o.amount.initial };
+    p := { amount; orders = RBTree.insert(p.orders, Nat.compare, oid, ()) };
+    savePrice(book, o, p);
+  };
+  public func deletePrice(book : Book, oid : Nat, o : Order) : Book {
+    var p = getPrice(book, o.price);
+    let amount = {
+      p.amount with initial = p.amount.initial - o.amount.initial;
+      filled = p.amount.filled - o.amount.filled;
+    };
+    p := { amount; orders = RBTree.delete(p.orders, Nat.compare, oid) };
+    savePrice(book, o, p);
+  };
+
   type Call<OkT, ErrT> = {
     #Calling : { caller : Principal };
     #Called : Result.Type<OkT, ErrT>;
@@ -201,15 +211,23 @@ module {
     locked = 0;
     filled = 0;
   };
+  public func timesPrice(a : Amount, price : Nat) : Amount = ({
+    initial = a.initial * price;
+    filled = a.filled * price;
+    locked = a.locked * price;
+  });
+  public func addAmount(a : Amount, b : Amount) : Amount = ({
+    initial = a.initial + (b.initial * price);
+  });
   type Subaccount = {
     id : Nat;
-    orders : RBTree.Type<(id : Nat), ()>;
+    orders : IDs;
     // note: cant place order on same price
     sells : RBTree.Type<(price : Nat), (order : Nat)>;
     sell_amount : Amount; // in sell unit
     buys : RBTree.Type<(price : Nat), (order : Nat)>;
     buy_amount : Amount; // in buy unit
-    trades : RBTree.Type<(id : Nat), ()>; // ongoing/finished trade ids
+    trades : IDs; // ongoing/finished
   };
   type Subaccounts = RBTree.Type<Blob, Subaccount>;
   public func getSubaccount<K>(user : User, subaccount : Blob) : Subaccount = switch (RBTree.get(user.subaccounts, Blob.compare, subaccount)) {
@@ -624,13 +642,21 @@ module {
     #Map(RBTree.array(map));
   };
 
-  public type Expiries = RBTree.Type<Nat64, RBTree.Type<Nat, ()>>;
-  public func saveExpiry(expiries : Expiries, expiry : Nat64, id : Nat) : Expiries {
-    var expiring_items = switch (RBTree.get(expiries, Nat64.compare, expiry)) {
-      case (?found) found;
-      case _ RBTree.empty();
-    };
+  type IDs = RBTree.Type<Nat, ()>;
+  public type Expiries = RBTree.Type<Nat64, IDs>;
+  public func getExpiry(expiries : Expiries, expiry : Nat64) : IDs = switch (RBTree.get(expiries, Nat64.compare, expiry)) {
+    case (?found) found;
+    case _ RBTree.empty();
+  };
+  public func saveExpiry(expiries : Expiries, expiry : Nat64, ids : IDs) : Expiries = if (RBTree.size(ids) > 0) RBTree.insert(expiries, Nat64.compare, expiry, ids) else RBTree.delete(expiries, Nat64.compare, expiry);
+  public func insertExpiry(expiries : Expiries, expiry : Nat64, id : Nat) : Expiries {
+    var expiring_items = getExpiry(expiries, expiry);
     expiring_items := RBTree.insert(expiring_items, Nat.compare, id, ());
-    RBTree.insert(expiries, Nat64.compare, expiry, expiring_items);
+    saveExpiry(expiries, expiry, expiring_items);
+  };
+  public func deleteExpiry(expiries : Expiries, expiry : Nat64, id : Nat) : Expiries {
+    var expiring_items = getExpiry(expiries, expiry);
+    expiring_items := RBTree.delete(expiring_items, Nat.compare, id);
+    saveExpiry(expiries, expiry, expiring_items);
   };
 };

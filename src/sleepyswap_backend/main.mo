@@ -26,9 +26,11 @@ shared (install) persistent actor class Canister(
   var order_id = 0;
   var orders = RBTree.empty<Nat, Sleepy.Order>();
   var orders_by_expiry : Sleepy.Expiries = RBTree.empty();
+  // 1st round - expiry
+  // 2nd round - deletion by ttl
 
-  var sell_book = RBTree.empty<Nat, Sleepy.Price>();
-  var buy_book = RBTree.empty<Nat, Sleepy.Price>();
+  var sell_book : Sleepy.Book = RBTree.empty();
+  var buy_book : Sleepy.Book = RBTree.empty();
 
   var sell_amount = Sleepy.newAmount(0);
   var buy_amount = Sleepy.newAmount(0); // in buy unit
@@ -366,9 +368,9 @@ shared (install) persistent actor class Canister(
           };
           let new_cid = credit_id;
           credits := RBTree.insert(credits, Nat.compare, new_cid, { owner = user.id; amount = reward; used = 0 });
-          credits_by_expiry := Sleepy.saveExpiry(credits_by_expiry, reward_expiry, new_cid);
+          credits_by_expiry := Sleepy.insertExpiry(credits_by_expiry, reward_expiry, new_cid);
           user := {
-            user with credits_by_expiry = Sleepy.saveExpiry(user.credits_by_expiry, reward_expiry, new_cid)
+            user with credits_by_expiry = Sleepy.insertExpiry(user.credits_by_expiry, reward_expiry, new_cid)
           };
           #None;
         };
@@ -410,13 +412,9 @@ shared (install) persistent actor class Canister(
           };
           let new_cid = credit_id;
           credits := RBTree.insert(credits, Nat.compare, new_cid, { owner = user.id; amount = reward; used = 0 });
-          let expiring_credits = switch (RBTree.get(credits_by_expiry, Nat64.compare, reward_expiry)) {
-            case (?found) found;
-            case _ RBTree.empty();
-          };
-          credits_by_expiry := RBTree.insert(credits_by_expiry, Nat64.compare, reward_expiry, RBTree.insert(expiring_credits, Nat.compare, new_cid, ()));
+          credits_by_expiry := Sleepy.insertExpiry(credits_by_expiry, reward_expiry, new_cid);
           user := {
-            user with credits_by_expiry = Sleepy.saveExpiry(user.credits_by_expiry, reward_expiry, new_cid)
+            user with credits_by_expiry = Sleepy.insertExpiry(user.credits_by_expiry, reward_expiry, new_cid)
           };
           #ICRC2 { payment with xfer };
         };
@@ -427,14 +425,12 @@ shared (install) persistent actor class Canister(
         let new_oid = order_id;
         let new_order = Sleepy.newOrder(now, user.id, subaccount.id, false, incoming_price, incoming_detail, authorized);
         orders := RBTree.insert(orders, Nat.compare, new_oid, new_order);
-        orders_by_expiry := Sleepy.saveExpiry(orders_by_expiry, incoming_detail.expires_at, new_oid);
+        orders_by_expiry := Sleepy.insertExpiry(orders_by_expiry, incoming_detail.expires_at, new_oid);
         order_id += 1;
 
         subaccount := Sleepy.subaccountNewOrder(subaccount, new_oid, new_order);
 
-        var price = Sleepy.getPrice(sell_book, new_order.price);
-        price := Sleepy.priceNewOrder(price, new_oid, new_order);
-        sell_book := Sleepy.savePrice(sell_book, new_order, price);
+        sell_book := Sleepy.insertPrice(sell_book, new_oid, new_order);
 
         res_buff.add(new_oid);
       };
@@ -446,14 +442,12 @@ shared (install) persistent actor class Canister(
         let new_oid = order_id;
         let new_order = Sleepy.newOrder(now, user.id, subaccount.id, true, incoming_price, incoming_detail, authorized);
         orders := RBTree.insert(orders, Nat.compare, new_oid, new_order);
-        orders_by_expiry := Sleepy.saveExpiry(orders_by_expiry, incoming_detail.expires_at, new_oid);
+        orders_by_expiry := Sleepy.insertExpiry(orders_by_expiry, incoming_detail.expires_at, new_oid);
         order_id += 1;
 
         subaccount := Sleepy.subaccountNewOrder(subaccount, new_oid, new_order);
 
-        var price = Sleepy.getPrice(buy_book, new_order.price);
-        price := Sleepy.priceNewOrder(price, new_oid, new_order);
-        buy_book := Sleepy.savePrice(buy_book, new_order, price);
+        buy_book := Sleepy.insertPrice(buy_book, new_oid, new_order);
 
         res_buff.add(new_oid);
       };
@@ -481,7 +475,6 @@ shared (install) persistent actor class Canister(
   // todo: include credit reward in block
   // todo: include credit reward in return(?)
 
-  // todo:
   public shared ({ caller }) func sleepyswap_cancel(arg : Sleepy.CancelArg) : async Sleepy.CancelResult {
     let user_account = { owner = caller; subaccount = arg.subaccount };
     if (not Account.validate(user_account)) return Error.text("Caller account is not valid");
@@ -499,7 +492,8 @@ shared (install) persistent actor class Canister(
     var subaccount = Sleepy.getSubaccount(user, arg_subaccount);
 
     let res_buff = Buffer.Buffer<Sleepy.OrderCancelResult>(batch_size);
-    var close_set = RBTree.empty<Nat, ()>();
+    var closed_set = RBTree.empty<Nat, ()>();
+    var expired_set = RBTree.empty<Nat, ()>();
     let def_p = Management.principal();
     let now = Time64.nanos();
     // todo: remove the order from the book
@@ -544,17 +538,61 @@ shared (install) persistent actor class Canister(
         };
         case _ ();
       };
-      order := { order with closed = ?{ at = now; reason = #Canceled } };
+      let reason = if (order.expires_at < now) {
+        expired_set := RBTree.insert(expired_set, Nat.compare, oid, ());
+        #Expired;
+      } else {
+        closed_set := RBTree.insert(closed_set, Nat.compare, oid, ());
+        #Canceled;
+      };
+      order := { order with closed = ?{ at = now; reason } };
       orders := RBTree.insert(orders, Nat.compare, oid, order);
+      orders_by_expiry := Sleepy.deleteExpiry(orders_by_expiry, order.expires_at, oid);
+      // orders_by_expiry := Sleepy.insertExpiry(orders_by_expiry, order.expires_at + ttl, oid); // todo: finish this
+
+      if (order.is_buy) {
+        buy_book := Sleepy.deletePrice(buy_book, oid, order);
+        buy_amount := {
+          buy_amount with initial = buy_amount.initial - (order.amount.initial * order.price);
+          filled = buy_amount.filled - (order.amount.filled * order.price);
+        };
+        subaccount := {
+          subaccount with buys = RBTree.delete(subaccount.buys, Nat.compare, order.price);
+          buy_amount = {
+            subaccount.buy_amount with initial = buy_amount.initial - (order.amount.initial * order.price);
+            filled = buy_amount.filled - (order.amount.filled * order.price);
+          };
+        };
+      } else {
+        sell_book := Sleepy.deletePrice(sell_book, oid, order);
+        sell_amount := {
+          sell_amount with initial = sell_amount.initial - order.amount.initial;
+          filled = sell_amount.filled - order.amount.filled;
+        };
+        subaccount := {
+          subaccount with sells = RBTree.delete(subaccount.sells, Nat.compare, order.price);
+          sell_amount = {
+            subaccount.sell_amount with initial = sell_amount.initial - order.amount.initial;
+            filled = sell_amount.filled - order.amount.filled;
+          };
+        };
+      };
       res_buff.add(#Ok);
-      close_set := RBTree.insert(close_set, Nat.compare, oid, ());
     };
-    let closes = RBTree.arrayKey(close_set);
+    user := saveUser(caller, Sleepy.saveSubaccount(user, arg_subaccount, subaccount));
+
+    let closes = RBTree.arrayKey(closed_set);
     if (closes.size() > 0) {
+      // todo: blockify
+    };
+    let expires = RBTree.arrayKey(expired_set);
+    if (expires.size() > 0) {
       // todo: blockify
     };
     #Ok(Buffer.toArray(res_buff));
   };
+  // todo: set max capacity to dedupes
+  // todo: set max capacity to orders?
   // todo: rename sleepyswap to something else
   public shared ({ caller }) func sleepyswap_match() : async () {
 
