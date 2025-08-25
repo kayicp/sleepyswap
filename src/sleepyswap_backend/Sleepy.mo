@@ -30,13 +30,11 @@ module {
   public let MIN_BUY_AMOUNT = "sleepyswap:minimum_buy_amount";
   public let MIN_SELL_AMOUNT = "sleepyswap:minimum_sell_amount";
   public let MIN_PRICE = "sleepyswap:minimum_price";
-  public let TTL = "sleepyswap:time_to_live";
+  public let TTL = "sleepyswap:time_to_live"; // seconds
   public let DEFAULT_ORDER_EXPIRY = "sleepyswap:default_order_expiry";
   public let MAX_ORDER_EXPIRY = "sleepyswap:max_order_expiry";
   public let MIN_ORDER_EXPIRY = "sleepyswap:min_order_expiry";
   public let AUTH_NONE_PLACE_RATE_LIMIT = "sleepyswap:auth_none_place_rate_limit"; // millisecond
-  public let AUTH_NONE_CANCEL_RATE_LIMIT = "sleepyswap:auth_none_cancel_rate_limit"; // millisecond
-  public let AUTH_NONE_WORK_RATE_LIMIT = "sleepyswap:auth_none_work_rate_limit"; // millisecond
   public let AUTH_NONE_CREDIT_REWARD = "sleepyswap:auth_none_credit_reward"; // 1 (waiting)
   public let AUTH_NONE_CREDIT_REWARD_EXPIRY = "sleepyswap:auth_none_credit_reward_expiry"; // 3 days
   public let AUTH_ICRC2_RATES = "sleepyswap:auth_icrc2_fee_rates"; // map(canisterid, amount)
@@ -49,7 +47,8 @@ module {
   public let MIN_MEMO = "sleepyswap:min_memo_size";
   public let MAX_MEMO = "sleepyswap:max_memo_size";
 
-  public let WORK_RATE_LIMIT = "sleepyswap:work_rate_limit"; // caller's last work rate limit, millisecond
+  public let CANCEL_RATE_LIMIT = "sleepyswap:cancel_rate_limit"; // millisecond
+  public let WORK_RATE_LIMIT = "sleepyswap:work_rate_limit"; // millisecond
 
   /* ratelimits for free calls
     place:
@@ -61,8 +60,8 @@ module {
       user: n/a
       subaccount: n/a
     work:
-      global: 10ms = 100 jobs per second
-      user: 10ms per job (this way same caller cant spam call or the same job, but can retry later)
+      global: 10ms per job (this way same caller cant spam call or the same job, but can retry later)
+      user: n/a
       subaccount: n/a
   */
 
@@ -219,6 +218,24 @@ module {
       case (#Ok xfer, ?(time, #Calling { caller })) #EscrowToTaker(#Transferring { time; caller; maker_to_escrow; taker_to_maker = { t2m with xfer } });
       case (#Ok xfer, ?(time, #Called(#Err err))) #EscrowToTaker(#Failed { time; err; maker_to_escrow; taker_to_maker = { t2m with xfer } });
       case (#Ok xferZ, ?(time, #Called(#Ok xfer))) #EscrowToTaker(#Ok { time; xfer; maker_to_escrow; taker_to_maker = { t2m with xfer = xferZ } });
+    };
+  };
+  public func tradeLocker() {
+    switch (RBTree.maxKey(order.trades)) {
+      case (?max) switch (RBTree.get(trades, Nat.compare, max)) {
+        case (?trade) switch (Sleepy.tradeStory(trade)) {
+          case (#MakerToEscrow(#Pending)) ();
+          case (#MakerToEscrow(#Failed _)) ();
+          case (#EscrowRefundMaker(#Ok _)) ();
+          case (#EscrowToTaker(#Ok _)) ();
+          case _ {
+            res_buff.add(#Err(#Locked { trade = max }));
+            continue looping;
+          };
+        };
+        case _ ();
+      };
+      case _ ();
     };
   };
   type Amount = { initial : Nat; locked : Nat; filled : Nat };
@@ -663,21 +680,19 @@ module {
   };
   public func saveExpiry(expiries : Expiries, expiry : Nat64, ids : IDs) : Expiries = if (RBTree.size(ids) > 0) RBTree.insert(expiries, Nat64.compare, expiry, ids) else RBTree.delete(expiries, Nat64.compare, expiry);
   public func insertExpiry(expiries : Expiries, expiry : Nat64, id : Nat) : Expiries {
-    var expiring_items = getExpiry(expiries, expiry);
-    expiring_items := RBTree.insert(expiring_items, Nat.compare, id, ());
-    saveExpiry(expiries, expiry, expiring_items);
+    var expiring_ids = getExpiry(expiries, expiry);
+    expiring_ids := RBTree.insert(expiring_ids, Nat.compare, id, ());
+    saveExpiry(expiries, expiry, expiring_ids);
   };
   public func deleteExpiry(expiries : Expiries, expiry : Nat64, id : Nat) : Expiries {
-    var expiring_items = getExpiry(expiries, expiry);
-    expiring_items := RBTree.delete(expiring_items, Nat.compare, id);
-    saveExpiry(expiries, expiry, expiring_items);
+    var expiring_ids = getExpiry(expiries, expiry);
+    expiring_ids := RBTree.delete(expiring_ids, Nat.compare, id);
+    saveExpiry(expiries, expiry, expiring_ids);
   };
 
-  public type WorkArg = {
-    subaccount : ?Blob;
-    memo : ?Blob;
-    authorization : ?Authorization;
-  };
+  public type WorkArg = { subaccount : ?Blob };
   public type WorkErr = { #GenericError : Error.Type };
-  public type WorkResult = Result.Type<Nat, WorkErr>; // token reward minting rounds
+  public type WorkResult = Result.Type<Nat, WorkErr>; // token reward minting
+
+  public func canWork(caller : Principal, last_caller : Principal, available_time : Nat64, now : Nat64) : Bool = if (caller == last_caller) available_time < now else true;
 };

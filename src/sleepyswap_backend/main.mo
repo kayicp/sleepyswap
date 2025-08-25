@@ -468,7 +468,6 @@ shared (install) persistent actor class Canister(
   // todo: include credit reward in block
   // todo: include credit reward in return(?)
 
-  // todo: check user's orders first faster to check, global orders later
   public shared ({ caller }) func sleepyswap_cancel(arg : Sleepy.CancelArg) : async [Sleepy.CancelResult] {
     let user_account = { owner = caller; subaccount = arg.subaccount };
     if (not Account.validate(user_account)) return [Error.textBatch("Caller account is not valid")];
@@ -489,16 +488,23 @@ shared (install) persistent actor class Canister(
     };
 
     let min_rate_limit = Time64.MILLI(2000);
-    var none_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_CANCEL_RATE_LIMIT, 0)));
-    if (none_rate_limit < min_rate_limit) {
-      none_rate_limit := min_rate_limit;
-      metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_CANCEL_RATE_LIMIT, ?2000);
+    var rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.CANCEL_RATE_LIMIT, 0)));
+    if (rate_limit < min_rate_limit) {
+      rate_limit := min_rate_limit;
+      metadata := Value.setNat(metadata, Sleepy.CANCEL_RATE_LIMIT, ?2000);
     };
 
     let res_buff = Buffer.Buffer<Sleepy.CancelResult>(batch_size);
     var closed_set = RBTree.empty<Nat, ()>();
     var expired_set = RBTree.empty<Nat, ()>();
     let now = Time64.nanos();
+    let min_ttl = Time64.DAYS(1);
+    var ttl = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.TTL, 0)));
+    if (ttl < min_ttl) {
+      ttl := min_ttl;
+      metadata := Value.setNat(metadata, Sleepy.TTL, ?86400);
+    };
+
     label looping for (oid in arg.orders.vals()) {
       var order = switch (RBTree.get(subaccount.orders, Nat.compare, oid)) {
         case (?_) switch (RBTree.get(orders, Nat.compare, oid)) {
@@ -536,7 +542,7 @@ shared (install) persistent actor class Canister(
         };
         case _ ();
       };
-      let available_time = order.created_at + none_rate_limit;
+      let available_time = order.created_at + rate_limit;
       if (now < available_time) {
         res_buff.add(#Err(#TemporarilyUnavailable { time = now; available_time }));
         continue looping;
@@ -551,7 +557,7 @@ shared (install) persistent actor class Canister(
       order := { order with closed = ?{ at = now; reason } };
       orders := RBTree.insert(orders, Nat.compare, oid, order);
       orders_by_expiry := Sleepy.deleteExpiry(orders_by_expiry, order.expires_at, oid);
-      // orders_by_expiry := Sleepy.insertExpiry(orders_by_expiry, order.expires_at + ttl, oid); // todo: finish this
+      orders_by_expiry := Sleepy.insertExpiry(orders_by_expiry, order.expires_at + ttl, oid);
 
       if (order.is_buy) {
         buy_book := Sleepy.deletePrice(buy_book, oid, order);
@@ -585,25 +591,79 @@ shared (install) persistent actor class Canister(
   };
   // todo: set max capacity to dedupes
   // todo: set max capacity to orders?
-  // todo: rename sleepyswap to
+  // todo: rename sleepyswap (EEPY) to smoldex (SM0L)
   // var last_matcher = Management.principal();
   // var last_matched = 0 : Nat64;
   // var last_settler = Management.principal();
   // var last_settled = 0 : Nat64;
   // var last_archiver = Management.principal();
   // var last_archived = 0 : Nat64;
-  // var last_orders_trimmer = Management.principal();
-  // var last_orders_trimmed = 0 : Nat64;
-  // var last_dedupes_trimmer = Management.principal();
-  // var last_dedupes_trimmed = 0 : Nat64;
-  // var last_credits_trimmer = Management.principal();
-  // var last_credits_trimmed = 0 : Nat64;
+  var last_orders_trimmer = Management.principal();
+  var last_orders_trimmed = 0 : Nat64;
+  var last_credits_trimmer = Management.principal();
+  var last_credits_trimmed = 0 : Nat64;
+  var last_dedupes_trimmer = Management.principal();
+  var last_dedupes_trimmed = 0 : Nat64;
   // todo: inspect message
   public shared ({ caller }) func sleepyswap_work(arg : Sleepy.WorkArg) : async Sleepy.WorkResult {
     let user_account = { owner = caller; subaccount = arg.subaccount };
     if (not Account.validate(user_account)) return Error.text("Caller account is not valid");
 
+    let min_rate_limit = Time64.MILLI(1);
+    var rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.WORK_RATE_LIMIT, 0)));
+    if (rate_limit < min_rate_limit) {
+      rate_limit := min_rate_limit;
+      metadata := Value.setNat(metadata, Sleepy.WORK_RATE_LIMIT, ?1);
+    };
+    let now = Time64.nanos();
+    let min_ttl = Time64.DAYS(1);
+    var ttl = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.TTL, 0)));
+    if (ttl < min_ttl) {
+      ttl := min_ttl;
+      metadata := Value.setNat(metadata, Sleepy.TTL, ?86400);
+    };
+    var worked = false;
+    if (Sleepy.canWork(caller, last_orders_trimmer, last_orders_trimmed + rate_limit, now)) worked := trimOrder(now, ttl);
+
     #Ok 0;
+  };
+
+  func trimOrder(now : Nat64, ttl : Nat64) : Bool {
+    let (time, ids) = switch (RBTree.min(orders_by_expiry)) {
+      case (?found) found;
+      case _ return false;
+    };
+    if (time > now) return false; // not expired yet
+    let id = switch (RBTree.min(ids)) {
+      case (?(id, _)) id;
+      case _ {
+        orders_by_expiry := RBTree.delete(orders_by_expiry, Nat64.compare, time);
+        return false;
+      };
+    };
+    let order = switch (RBTree.get(orders, Nat.compare, id)) {
+      case (?found) found;
+      case _ {
+        orders_by_expiry := Sleepy.saveExpiry(orders_by_expiry, time, RBTree.delete(ids, Nat.compare, id));
+        return false;
+      };
+    };
+    func pushExpiry(new_expiry : Nat64) : Bool {
+      orders_by_expiry := Sleepy.saveExpiry(orders_by_expiry, time, RBTree.delete(ids, Nat.compare, id));
+      orders_by_expiry := Sleepy.insertExpiry(orders_by_expiry, new_expiry, id);
+      false;
+    };
+    switch (order.closed) {
+      case (?close) {
+        let new_expiry = close.at + ttl;
+        if (new_expiry > now) return pushExpiry(new_expiry);
+        // trim
+      };
+      case _ if (order.expires_at > now) return pushExpiry(order.expires_at) else {
+
+      };
+    };
+    true;
   };
 
   func getUser(p : Principal) : Sleepy.User = switch (RBTree.get(users, Principal.compare, p)) {
