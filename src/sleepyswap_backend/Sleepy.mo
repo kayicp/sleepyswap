@@ -94,16 +94,13 @@ module {
   } else RBTree.delete(book, Nat.compare, o.price);
   public func insertPrice(book : Book, oid : Nat, o : Order) : Book {
     var p = getPrice(book, o.price);
-    let amount = { p.amount with initial = p.amount.initial + o.amount.initial };
+    let amount = addAmount(p.amount, o.amount);
     p := { amount; orders = RBTree.insert(p.orders, Nat.compare, oid, ()) };
     savePrice(book, o, p);
   };
   public func deletePrice(book : Book, oid : Nat, o : Order) : Book {
     var p = getPrice(book, o.price);
-    let amount = {
-      p.amount with initial = p.amount.initial - o.amount.initial;
-      filled = p.amount.filled - o.amount.filled;
-    };
+    let amount = minusAmount(p.amount, o.amount);
     p := { amount; orders = RBTree.delete(p.orders, Nat.compare, oid) };
     savePrice(book, o, p);
   };
@@ -211,13 +208,20 @@ module {
     locked = 0;
     filled = 0;
   };
-  public func timesPrice(a : Amount, price : Nat) : Amount = ({
+  public func priceAmount(a : Amount, price : Nat) : Amount = ({
     initial = a.initial * price;
     filled = a.filled * price;
     locked = a.locked * price;
   });
-  public func addAmount(a : Amount, b : Amount) : Amount = ({
-    initial = a.initial + (b.initial * price);
+  public func addAmount(a : Amount, add : Amount) : Amount = ({
+    initial = a.initial + add.initial;
+    filled = a.filled + add.filled;
+    locked = a.locked + add.locked;
+  });
+  public func minusAmount(a : Amount, minus : Amount) : Amount = ({
+    initial = if (a.initial >= minus.initial) a.initial - minus.initial else 0;
+    filled = if (a.filled >= minus.filled) a.filled - minus.filled else 0;
+    locked = if (a.locked >= minus.locked) a.locked - minus.locked else 0;
   });
   type Subaccount = {
     id : Nat;
@@ -250,18 +254,13 @@ module {
   public func subaccountNewOrder(_sa : Subaccount, oid : Nat, o : Order) : Subaccount {
     let sa = if (o.is_buy) ({
       _sa with buys = RBTree.insert(_sa.buys, Nat.compare, o.price, oid);
-      buy_amount = {
-        _sa.buy_amount with initial = _sa.buy_amount.initial + (o.amount.initial * o.price)
-      };
+      buy_amount = addAmount(_sa.buy_amount, priceAmount(o.amount, o.price));
     }) else ({
       _sa with sells = RBTree.insert(_sa.sells, Nat.compare, o.price, oid);
-      sell_amount = {
-        _sa.sell_amount with initial = _sa.sell_amount.initial + o.amount.initial
-      };
+      sell_amount = addAmount(_sa.sell_amount, o.amount);
     });
-    {
-      sa with orders = RBTree.insert(sa.orders, Nat.compare, oid, ());
-    };
+    let orders = RBTree.insert(sa.orders, Nat.compare, oid, ());
+    { sa with orders };
   };
   public type Credit = {
     owner : Nat; // user id

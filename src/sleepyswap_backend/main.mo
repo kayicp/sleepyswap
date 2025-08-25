@@ -552,29 +552,18 @@ shared (install) persistent actor class Canister(
 
       if (order.is_buy) {
         buy_book := Sleepy.deletePrice(buy_book, oid, order);
-        buy_amount := {
-          buy_amount with initial = buy_amount.initial - (order.amount.initial * order.price);
-          filled = buy_amount.filled - (order.amount.filled * order.price);
-        };
+        let priced_amount = Sleepy.priceAmount(order.amount, order.price);
+        buy_amount := Sleepy.minusAmount(buy_amount, priced_amount);
         subaccount := {
           subaccount with buys = RBTree.delete(subaccount.buys, Nat.compare, order.price);
-          buy_amount = {
-            subaccount.buy_amount with initial = buy_amount.initial - (order.amount.initial * order.price);
-            filled = buy_amount.filled - (order.amount.filled * order.price);
-          };
+          buy_amount = Sleepy.minusAmount(subaccount.buy_amount, priced_amount);
         };
       } else {
         sell_book := Sleepy.deletePrice(sell_book, oid, order);
-        sell_amount := {
-          sell_amount with initial = sell_amount.initial - order.amount.initial;
-          filled = sell_amount.filled - order.amount.filled;
-        };
+        sell_amount := Sleepy.minusAmount(sell_amount, order.amount);
         subaccount := {
           subaccount with sells = RBTree.delete(subaccount.sells, Nat.compare, order.price);
-          sell_amount = {
-            subaccount.sell_amount with initial = sell_amount.initial - order.amount.initial;
-            filled = sell_amount.filled - order.amount.filled;
-          };
+          sell_amount = Sleepy.minusAmount(subaccount.sell_amount, order.amount);
         };
       };
       res_buff.add(#Ok);
