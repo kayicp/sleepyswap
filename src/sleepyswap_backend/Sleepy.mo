@@ -34,7 +34,9 @@ module {
   public let DEFAULT_ORDER_EXPIRY = "sleepyswap:default_order_expiry";
   public let MAX_ORDER_EXPIRY = "sleepyswap:max_order_expiry";
   public let MIN_ORDER_EXPIRY = "sleepyswap:min_order_expiry";
-  public let AUTH_NONE_RATE_LIMIT = "sleepyswap:auth_none_rate_limit"; // millisecond
+  public let AUTH_NONE_PLACE_RATE_LIMIT = "sleepyswap:auth_none_place_rate_limit"; // millisecond
+  public let AUTH_NONE_CANCEL_RATE_LIMIT = "sleepyswap:auth_none_cancel_rate_limit"; // millisecond
+  public let AUTH_NONE_WORK_RATE_LIMIT = "sleepyswap:auth_none_work_rate_limit"; // millisecond
   public let AUTH_NONE_CREDIT_REWARD = "sleepyswap:auth_none_credit_reward"; // 1 (waiting)
   public let AUTH_NONE_CREDIT_REWARD_EXPIRY = "sleepyswap:auth_none_credit_reward_expiry"; // 3 days
   public let AUTH_ICRC2_RATES = "sleepyswap:auth_icrc2_fee_rates"; // map(canisterid, amount)
@@ -46,6 +48,23 @@ module {
 
   public let MIN_MEMO = "sleepyswap:min_memo_size";
   public let MAX_MEMO = "sleepyswap:max_memo_size";
+
+  public let WORK_RATE_LIMIT = "sleepyswap:work_rate_limit"; // caller's last work rate limit, millisecond
+
+  /* ratelimits for free calls
+    place:
+      global: n/a
+      user: 1s after last_none_placed = 10 max orders
+      subaccount = n/a
+    cancel:
+      global: 3s after free order creation (because token transfers take at most 3s)
+      user: n/a
+      subaccount: n/a
+    work:
+      global: 10ms = 100 jobs per second
+      user: 10ms per job (this way same caller cant spam call or the same job, but can retry later)
+      subaccount: n/a
+  */
 
   type OrderClosed = {
     at : Nat64;
@@ -271,6 +290,7 @@ module {
   public type User = {
     id : Nat;
     place_locked : ?Nat64;
+    last_none_placed : Nat64;
     subaccounts : RBTree.Type<Blob, Subaccount>;
     subaccount_ids : RBTree.Type<Nat, Blob>;
     credits_by_expiry : Expiries;
@@ -413,18 +433,16 @@ module {
     orders : [Nat];
   };
   public type CancelError = {
-    #GenericError : Error.Type;
+    #GenericBatchError : Error.Type;
     #BatchTooLarge : { batch_size : Nat; maximum_batch_size : Nat };
-  };
-  public type OrderCancelResult = {
-    #Ok;
+
+    #GenericError : Error.Type;
     #NotFound;
-    #NotOwner : { owner : Principal; caller : Principal };
-    #NotSubaccount : { subaccount : Blob; caller_subaccount : Blob };
     #Closed : OrderClosed;
     #Locked : { trade : Nat };
+    #TemporarilyUnavailable : { time : Nat64; available_time : Nat64 };
   };
-  public type CancelResult = Result.Type<[OrderCancelResult], CancelError>;
+  public type CancelResult = Result.Type<(), CancelError>;
 
   public func recycleId<K>(ids : RBTree.Type<Nat, K>) : Nat = switch (RBTree.minKey(ids), RBTree.maxKey(ids)) {
     case (?min_id, ?max_id) if (min_id > 0) min_id - 1 else max_id + 1;
@@ -451,11 +469,7 @@ module {
     #ICRC2 : ICRC2_Authorized;
   };
   type None_Failure = {
-    #TemporarilyUnavailable : {
-      time : Nat64;
-      available_time : Nat64;
-      used_by : Principal;
-    };
+    #TemporarilyUnavailable : { time : Nat64; available_time : Nat64 };
   };
   type Credit_Failure = {
     #OutOfCredit;
@@ -481,7 +495,7 @@ module {
     // #Custom : Auto_Failure;
   };
 
-  public func authNoneCheck(now : Nat64, none_available_time : Nat64, last_placer : Principal) : Result.Type<(), { #None : None_Failure }> = if (now < none_available_time) return #Err(#None(#TemporarilyUnavailable { time = now; available_time = none_available_time; used_by = last_placer })) else #Ok;
+  public func authNoneCheck(now : Nat64, none_available_time : Nat64) : Result.Type<(), { #None : None_Failure }> = if (now < none_available_time) return #Err(#None(#TemporarilyUnavailable { time = now; available_time = none_available_time })) else #Ok;
 
   public func authCreditCheck(user : User, now : Nat64, credits : Credits) : Result.Type<(), { #Credit : Credit_Failure }> = switch (findActiveCredit(user, now, credits)) {
     case (#Ok _) #Ok;
@@ -519,8 +533,8 @@ module {
     } else #Ok { auth with amount = expected_amount; fee };
   };
 
-  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, last_placer : Principal, user : User, credits : Credits, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<{ #None; #Credit; #ICRC2 : ICRC2_Selected }, ()> {
-    switch (authNoneCheck(now, none_available_time, last_placer)) {
+  public func authAutoCheck(failures : Buffer.Buffer<Auto_Failure>, now : Nat64, none_available_time : Nat64, user : User, credits : Credits, icrc2_rates : [(Value.Type, Value.Type)], user_account : Account.Pair, self : Principal) : async* Result.Type<{ #None; #Credit; #ICRC2 : ICRC2_Selected }, ()> {
+    switch (authNoneCheck(now, none_available_time)) {
       case (#Err(#None err)) failures.add(#None err);
       case _ return #Ok(#None);
     };
@@ -658,4 +672,12 @@ module {
     expiring_items := RBTree.delete(expiring_items, Nat.compare, id);
     saveExpiry(expiries, expiry, expiring_items);
   };
+
+  public type WorkArg = {
+    subaccount : ?Blob;
+    memo : ?Blob;
+    authorization : ?Authorization;
+  };
+  public type WorkErr = { #GenericError : Error.Type };
+  public type WorkResult = Result.Type<Nat, WorkErr>; // token reward minting rounds
 };

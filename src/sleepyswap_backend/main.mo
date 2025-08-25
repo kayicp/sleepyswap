@@ -5,6 +5,7 @@ import Nat64 "mo:base/Nat64";
 import Buffer "mo:base/Buffer";
 import Text "mo:base/Text";
 import Option "mo:base/Option";
+import Blob "mo:base/Blob";
 import Sleepy "Sleepy";
 
 import RBTree "../util/motoko/StableCollections/RedBlackTree/RBTree";
@@ -40,9 +41,6 @@ shared (install) persistent actor class Canister(
 
   var user_ids = RBTree.empty<Nat, Principal>();
   var users = RBTree.empty<Principal, Sleepy.User>();
-
-  var last_none_placed = 0 : Nat64;
-  var last_none_placer = Management.principal();
 
   var credit_id = 0;
   var credits = RBTree.empty<Nat, Sleepy.Credit>();
@@ -261,21 +259,21 @@ shared (install) persistent actor class Canister(
         case _ ();
       };
 
-      let min_rate_limit = Time64.SECONDS(1);
-      var none_rate_limit = Time64.SECONDS(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, 0)));
+      let min_rate_limit = Time64.MILLI(500);
+      var none_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_PLACE_RATE_LIMIT, 0)));
       if (none_rate_limit < min_rate_limit) {
         none_rate_limit := min_rate_limit;
-        metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_RATE_LIMIT, ?1);
+        metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_PLACE_RATE_LIMIT, ?500);
       };
 
       let icrc2_rates = Option.get(Value.metaValueMapArray(metadata, Sleepy.AUTH_ICRC2_RATES), []);
 
-      let none_available_time = last_none_placed + none_rate_limit;
+      let none_available_time = user.last_none_placed + none_rate_limit;
       let auto_errors = Buffer.Buffer<Sleepy.Auto_Failure>(3 + icrc2_rates.size()); // none, credit, eepy, icp, ckbtc
 
       let self = Principal.fromActor(Self);
       let valid_auth = switch (arg.authorization) {
-        case (?#None) switch (Sleepy.authNoneCheck(now, none_available_time, last_none_placer)) {
+        case (?#None) switch (Sleepy.authNoneCheck(now, none_available_time)) {
           case (#Err err) return #Err(#Unauthorized err);
           case _ #None;
         };
@@ -288,7 +286,7 @@ shared (install) persistent actor class Canister(
           case (#Err(#Text err)) return Error.text(err);
           case (#Ok payment) #ICRC2 payment;
         };
-        case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, last_none_placer, user, credits, icrc2_rates, user_account, self)) {
+        case _ switch (await* Sleepy.authAutoCheck(auto_errors, now, none_available_time, user, credits, icrc2_rates, user_account, self)) {
           case (#Ok selected) selected;
           case _ return #Err(#Unauthorized(#Automatic { failures = Buffer.toArray(auto_errors) }));
         };
@@ -352,8 +350,6 @@ shared (install) persistent actor class Canister(
       // write mode
       let authorized = switch valid_auth {
         case (#None) {
-          last_none_placed := now;
-          last_none_placer := caller;
           let min_reward = 1;
           var reward = Value.getNat(metadata, Sleepy.AUTH_NONE_CREDIT_REWARD, 0);
           if (reward < min_reward) {
@@ -370,7 +366,8 @@ shared (install) persistent actor class Canister(
           credits := RBTree.insert(credits, Nat.compare, new_cid, { owner = user.id; amount = reward; used = 0 });
           credits_by_expiry := Sleepy.insertExpiry(credits_by_expiry, reward_expiry, new_cid);
           user := {
-            user with credits_by_expiry = Sleepy.insertExpiry(user.credits_by_expiry, reward_expiry, new_cid)
+            user with last_none_placed = now;
+            credits_by_expiry = Sleepy.insertExpiry(user.credits_by_expiry, reward_expiry, new_cid);
           };
           #None;
         };
@@ -434,9 +431,7 @@ shared (install) persistent actor class Canister(
 
         res_buff.add(new_oid);
       };
-      sell_amount := {
-        sell_amount with initial = sell_amount.initial + total_incoming_sell_amount
-      };
+      sell_amount := Sleepy.addAmount(sell_amount, Sleepy.newAmount(total_incoming_sell_amount));
 
       for ((incoming_price, incoming_detail) in RBTree.entries(incoming_buys)) {
         let new_oid = order_id;
@@ -451,9 +446,7 @@ shared (install) persistent actor class Canister(
 
         res_buff.add(new_oid);
       };
-      buy_amount := {
-        buy_amount with initial = buy_amount.initial + total_incoming_buy_amount
-      };
+      buy_amount := Sleepy.addAmount(buy_amount, Sleepy.newAmount(total_incoming_buy_amount));
       user := Sleepy.saveSubaccount(user, arg_subaccount, subaccount);
       unlock();
 
@@ -475,49 +468,54 @@ shared (install) persistent actor class Canister(
   // todo: include credit reward in block
   // todo: include credit reward in return(?)
 
-  public shared ({ caller }) func sleepyswap_cancel(arg : Sleepy.CancelArg) : async Sleepy.CancelResult {
+  // todo: check user's orders first faster to check, global orders later
+  public shared ({ caller }) func sleepyswap_cancel(arg : Sleepy.CancelArg) : async [Sleepy.CancelResult] {
     let user_account = { owner = caller; subaccount = arg.subaccount };
-    if (not Account.validate(user_account)) return Error.text("Caller account is not valid");
+    if (not Account.validate(user_account)) return [Error.textBatch("Caller account is not valid")];
 
     let batch_size = arg.orders.size();
-    if (batch_size == 0) return Error.text("Orders cannot be empty");
+    if (batch_size == 0) return [Error.textBatch("Orders cannot be empty")];
     let max_batch = Value.getNat(metadata, Sleepy.MAX_ORDER_BATCH, 0);
-    if (max_batch > 0 and batch_size > max_batch) return #Err(#BatchTooLarge { batch_size = batch_size; maximum_batch_size = max_batch });
+    if (max_batch > 0 and batch_size > max_batch) return [#Err(#BatchTooLarge { batch_size = batch_size; maximum_batch_size = max_batch })];
 
     var user = switch (RBTree.get(users, Principal.compare, caller)) {
       case (?found) found;
-      case _ return Error.text("Caller is not a user");
+      case _ return [Error.textBatch("Caller is not a user")];
     };
     let arg_subaccount = Account.denull(arg.subaccount);
-    var subaccount = Sleepy.getSubaccount(user, arg_subaccount);
+    var subaccount = switch (RBTree.get(user.subaccounts, Blob.compare, arg_subaccount)) {
+      case (?found) found;
+      case _ return [Error.textBatch("Caller's subaccount not exist")];
+    };
 
-    let res_buff = Buffer.Buffer<Sleepy.OrderCancelResult>(batch_size);
+    let min_rate_limit = Time64.MILLI(2000);
+    var none_rate_limit = Time64.MILLI(Nat64.fromNat(Value.getNat(metadata, Sleepy.AUTH_NONE_CANCEL_RATE_LIMIT, 0)));
+    if (none_rate_limit < min_rate_limit) {
+      none_rate_limit := min_rate_limit;
+      metadata := Value.setNat(metadata, Sleepy.AUTH_NONE_CANCEL_RATE_LIMIT, ?2000);
+    };
+
+    let res_buff = Buffer.Buffer<Sleepy.CancelResult>(batch_size);
     var closed_set = RBTree.empty<Nat, ()>();
     var expired_set = RBTree.empty<Nat, ()>();
-    let def_p = Management.principal();
     let now = Time64.nanos();
-    // todo: remove the order from the book
     label looping for (oid in arg.orders.vals()) {
-      var order = switch (RBTree.get(orders, Nat.compare, oid)) {
-        case (?found) found;
+      var order = switch (RBTree.get(subaccount.orders, Nat.compare, oid)) {
+        case (?_) switch (RBTree.get(orders, Nat.compare, oid)) {
+          case (?found) found;
+          case _ {
+            res_buff.add(#Err(#NotFound));
+            continue looping;
+          };
+        };
         case _ {
-          res_buff.add(#NotFound);
+          res_buff.add(#Err(#NotFound));
           continue looping;
         };
       };
-      if (order.owner != user.id) {
-        let p = Option.get(RBTree.get(user_ids, Nat.compare, order.owner), def_p);
-        res_buff.add(#NotOwner { owner = p; caller });
-        continue looping;
-      };
-      if (order.subaccount != subaccount.id) {
-        let s = Option.get(RBTree.get(user.subaccount_ids, Nat.compare, order.subaccount), "" : Blob);
-        res_buff.add(#NotSubaccount { subaccount = s; caller_subaccount = arg_subaccount });
-        continue looping;
-      };
       switch (order.closed) {
         case (?found) {
-          res_buff.add(#Closed found);
+          res_buff.add(#Err(#Closed found));
           continue looping;
         };
         case _ ();
@@ -530,13 +528,18 @@ shared (install) persistent actor class Canister(
             case (#EscrowRefundMaker(#Ok _)) ();
             case (#EscrowToTaker(#Ok _)) ();
             case _ {
-              res_buff.add(#Locked { trade = max });
+              res_buff.add(#Err(#Locked { trade = max }));
               continue looping;
             };
           };
           case _ ();
         };
         case _ ();
+      };
+      let available_time = order.created_at + none_rate_limit;
+      if (now < available_time) {
+        res_buff.add(#Err(#TemporarilyUnavailable { time = now; available_time }));
+        continue looping;
       };
       let reason = if (order.expires_at < now) {
         expired_set := RBTree.insert(expired_set, Nat.compare, oid, ());
@@ -578,33 +581,29 @@ shared (install) persistent actor class Canister(
     if (expires.size() > 0) {
       // todo: blockify
     };
-    #Ok(Buffer.toArray(res_buff));
+    Buffer.toArray(res_buff);
   };
   // todo: set max capacity to dedupes
   // todo: set max capacity to orders?
-  // todo: rename sleepyswap to something else
-  public shared ({ caller }) func sleepyswap_match() : async () {
+  // todo: rename sleepyswap to
+  // var last_matcher = Management.principal();
+  // var last_matched = 0 : Nat64;
+  // var last_settler = Management.principal();
+  // var last_settled = 0 : Nat64;
+  // var last_archiver = Management.principal();
+  // var last_archived = 0 : Nat64;
+  // var last_orders_trimmer = Management.principal();
+  // var last_orders_trimmed = 0 : Nat64;
+  // var last_dedupes_trimmer = Management.principal();
+  // var last_dedupes_trimmed = 0 : Nat64;
+  // var last_credits_trimmer = Management.principal();
+  // var last_credits_trimmed = 0 : Nat64;
+  // todo: inspect message
+  public shared ({ caller }) func sleepyswap_work(arg : Sleepy.WorkArg) : async Sleepy.WorkResult {
+    let user_account = { owner = caller; subaccount = arg.subaccount };
+    if (not Account.validate(user_account)) return Error.text("Caller account is not valid");
 
-  };
-
-  public shared ({ caller }) func sleepyswap_settle() : async () {
-
-  };
-
-  public shared ({ caller }) func sleepyswap_archive() : async () {
-
-  };
-
-  public shared ({ caller }) func sleepyswap_trim_orders() : async () {
-
-  };
-
-  public shared ({ caller }) func sleepyswap_trim_dedupes() : async () {
-
-  };
-
-  public shared ({ caller }) func sleepyswap_trim_credits() : async () {
-
+    #Ok 0;
   };
 
   func getUser(p : Principal) : Sleepy.User = switch (RBTree.get(users, Principal.compare, p)) {
@@ -612,9 +611,9 @@ shared (install) persistent actor class Canister(
     case _ ({
       id = Sleepy.recycleId(user_ids);
       place_locked = null;
+      last_none_placed = 0;
       subaccounts = RBTree.empty();
       subaccount_ids = RBTree.empty();
-      credits_unused = 0;
       credits_by_expiry = RBTree.empty();
     });
   };
